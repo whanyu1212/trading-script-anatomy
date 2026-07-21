@@ -4,6 +4,11 @@ from collections.abc import Collection
 from datetime import date, datetime
 import logging
 
+from trading_script_anatomy.broker.models import (
+    BrokerExecutionError,
+    OrderOutcome,
+    OrderOutcomeStatus,
+)
 from trading_script_anatomy.broker.protocols import Broker
 from trading_script_anatomy.config import StrategyConfig
 from trading_script_anatomy.data.protocols import IndexUniverseProvider, MarketDataProvider
@@ -71,11 +76,11 @@ class StrategyEngine:
         if as_of.weekday() != self.config.rebalance_weekday:
             return
         if self.is_empty_month(as_of):
-            self.handle_empty_month_clear(as_of)
-            self.handle_empty_month_etf(as_of)
+            if self.handle_empty_month_clear(as_of):
+                self.handle_empty_month_etf(as_of)
             return
 
-        self._sell_safe_etf()
+        safe_etf_sale_completed = self._sell_safe_etf()
         self.state.candidates = []
 
         target_symbols = self._selector.select_targets(
@@ -84,14 +89,18 @@ class StrategyEngine:
             self.state,
         )
         if not target_symbols:
-            self._buy_safe_etf()
+            if safe_etf_sale_completed:
+                self._buy_safe_etf()
             self.state.target_positions = []
             return
 
         self.state.target_positions = target_symbols
-        self._sell_positions_not_in(target_symbols)
-        self._buy_missing_positions(target_symbols)
-        self.state.last_rebalance_date = as_of
+        sales_completed = self._sell_positions_not_in(target_symbols)
+        buys_completed = False
+        if safe_etf_sale_completed and sales_completed:
+            buys_completed = self._buy_missing_positions(target_symbols)
+        if safe_etf_sale_completed and sales_completed and buys_completed:
+            self.state.last_rebalance_date = as_of
 
     def risk_check(self, as_of: date) -> None:
         """Run position-level exits and the market-wide stop-loss control.
@@ -103,32 +112,54 @@ class StrategyEngine:
             return
 
         sold_any = False
+        attempted_symbols = set(self.state.pending_exit_orders)
         for instruction in self._risk.position_exit_orders(
             self._equity_positions(), as_of
         ):
-            sold_any |= self._sell(
-                instruction.symbol, instruction.quantity, instruction.reason
+            if instruction.symbol in attempted_symbols:
+                continue
+            attempted_symbols.add(instruction.symbol)
+            outcome = self._sell(
+                instruction.symbol,
+                instruction.quantity,
+                instruction.reason,
             )
+            self._track_risk_exit(instruction.symbol, outcome)
+            sold_any |= self._is_filled(outcome)
 
         if self._risk.market_stop_loss_triggered(as_of):
             for position in self._equity_positions():
-                sold_any |= self._sell(
-                    position.symbol, position.quantity, "market_stop_loss"
+                if position.symbol in attempted_symbols:
+                    continue
+                attempted_symbols.add(position.symbol)
+                outcome = self._sell(
+                    position.symbol,
+                    position.quantity,
+                    "market_stop_loss",
                 )
+                self._track_risk_exit(position.symbol, outcome)
+                sold_any |= self._is_filled(outcome)
 
         if sold_any:
             self.state.stopped_out = True
 
-    def handle_empty_month_clear(self, as_of: date) -> None:
+    def handle_empty_month_clear(self, as_of: date) -> bool:
         """Liquidate equities during an empty month.
 
         Args:
             as_of: Trading date used to determine whether the month is empty.
+
+        Returns:
+            Whether every required equity sale completed.
         """
         if not self.is_empty_month(as_of):
-            return
+            return True
+        completed = True
         for position in self._equity_positions():
-            self._sell(position.symbol, position.quantity, "empty_month_clear")
+            completed &= self._is_filled(
+                self._sell(position.symbol, position.quantity, "empty_month_clear")
+            )
+        return completed
 
     def handle_empty_month_etf(self, as_of: date) -> None:
         """Invest available cash in the safe ETF on the rebalance weekday.
@@ -151,11 +182,19 @@ class StrategyEngine:
         if (
             self.state.stopped_out
             and not self.state.stop_loss_etf_bought
+            and self.state.stop_loss_etf_order_reference is None
             and now.hour >= 14
         ):
-            self._buy_safe_etf()
-            self.state.stop_loss_etf_bought = True
-            self.state.stopped_out = False
+            outcome = self._buy_safe_etf()
+            if (
+                outcome is not None
+                and outcome.status is not OrderOutcomeStatus.SKIPPED
+            ):
+                self.state.stop_loss_etf_bought = outcome.is_filled
+                self.state.stop_loss_etf_order_reference = (
+                    outcome.reference if outcome.is_pending else None
+                )
+                self.state.stopped_out = False
 
     def handle_data(self, now: datetime) -> None:
         """Run the intraday action formerly called by PTrade.
@@ -176,8 +215,10 @@ class StrategyEngine:
         """
         return as_of.month in self.config.empty_months
 
-    def _sell(self, symbol: str, quantity: float, reason: str) -> bool:
-        """Submit a sale, logging instead of raising on failure.
+    def _sell(
+        self, symbol: str, quantity: float, reason: str
+    ) -> OrderOutcome | None:
+        """Submit a sale and report its explicit broker outcome.
 
         Args:
             symbol: Ticker to sell.
@@ -185,64 +226,124 @@ class StrategyEngine:
             reason: Strategy event that triggered the sale.
 
         Returns:
-            Whether the order was submitted successfully.
+            Broker outcome, or ``None`` when execution failed.
         """
         try:
-            self.broker.order_quantity(symbol, -quantity, reason)
-            return True
-        except Exception as error:
+            outcome = self.broker.order_quantity(symbol, -quantity, reason)
+        except BrokerExecutionError as error:
             self._logger.error(
                 "Unable to execute %s for %s: %s", reason, symbol, error
             )
-            return False
+            return None
+        if outcome.is_pending:
+            self._logger.warning(
+                "%s order for %s requires reconciliation as %s",
+                reason,
+                symbol,
+                outcome.reference,
+            )
+        return outcome
 
-    def _sell_positions_not_in(self, target_symbols: Collection[str]) -> None:
-        """Sell positions that are not part of the target holdings."""
+    def _sell_positions_not_in(self, target_symbols: Collection[str]) -> bool:
+        """Sell non-target positions and report whether every sale filled."""
         target_set = set(target_symbols)
+        completed = True
         for position in self._equity_positions():
             if position.symbol not in target_set:
-                self._sell(position.symbol, position.quantity, "rebalance_sell")
+                completed &= self._is_filled(
+                    self._sell(
+                        position.symbol,
+                        position.quantity,
+                        "rebalance_sell",
+                    )
+                )
+        return completed
 
-    def _buy_missing_positions(self, target_symbols: Collection[str]) -> None:
-        """Buy missing targets with an equal division of available cash."""
+    def _buy_missing_positions(self, target_symbols: Collection[str]) -> bool:
+        """Buy missing targets and report whether every purchase filled."""
         held_symbols = self._equity_symbols()
         to_buy = [
             symbol for symbol in target_symbols if symbol not in held_symbols
         ]
         slots = min(len(target_symbols), self.state.stock_count) - len(held_symbols)
         to_buy = to_buy[:max(slots, 0)]
-        if not to_buy or self.broker.portfolio.cash <= 0:
-            return
+        if not to_buy:
+            return True
+        if self.broker.portfolio.cash <= 0:
+            return False
 
         cash_per_symbol = self.broker.portfolio.cash / len(to_buy)
+        completed = True
         for symbol in to_buy:
             try:
-                self.broker.order_value(symbol, cash_per_symbol, "rebalance_buy")
-            except Exception as error:
+                outcome = self.broker.order_value(
+                    symbol, cash_per_symbol, "rebalance_buy"
+                )
+            except BrokerExecutionError as error:
                 self._logger.error(
                     "Unable to rebalance-buy %s: %s", symbol, error
                 )
+                completed = False
+                continue
+            if outcome.is_pending:
+                self._logger.warning(
+                    "Rebalance-buy order for %s requires reconciliation as %s",
+                    symbol,
+                    outcome.reference,
+                )
+                return False
+            completed &= outcome.is_filled
+        return completed
 
-    def _sell_safe_etf(self) -> None:
-        """Sell the configured safe ETF before a normal weekly rebalance."""
+    def _sell_safe_etf(self) -> bool:
+        """Sell the safe ETF and report whether the required sale filled."""
         position = self._position(self.config.safe_etf_symbol)
         if position is None or position.quantity <= 0:
-            return
-        self._sell(self.config.safe_etf_symbol, position.quantity, "sell_safe_etf")
+            return True
+        return self._is_filled(
+            self._sell(
+                self.config.safe_etf_symbol,
+                position.quantity,
+                "sell_safe_etf",
+            )
+        )
 
-    def _buy_safe_etf(self) -> None:
-        """Invest all currently available cash in the configured safe ETF."""
+    def _buy_safe_etf(self) -> OrderOutcome | None:
+        """Invest available cash and return the broker's explicit outcome."""
         cash = self.broker.portfolio.cash
         if cash <= 0:
-            return
+            return OrderOutcome(OrderOutcomeStatus.SKIPPED)
         try:
-            self.broker.order_value(
+            outcome = self.broker.order_value(
                 self.config.safe_etf_symbol,
                 cash,
                 "buy_safe_etf",
             )
-        except Exception as error:
+        except BrokerExecutionError as error:
             self._logger.error("Unable to buy safe ETF: %s", error)
+            return None
+        if outcome.is_pending:
+            self._logger.warning(
+                "Safe ETF order requires reconciliation as %s",
+                outcome.reference,
+            )
+        return outcome
+
+    @staticmethod
+    def _is_filled(outcome: OrderOutcome | None) -> bool:
+        """Return whether a broker operation produced a completed fill."""
+        return outcome is not None and outcome.is_filled
+
+    def _track_risk_exit(
+        self, symbol: str, outcome: OrderOutcome | None
+    ) -> None:
+        """Prevent duplicate risk exits while a broker order remains open."""
+        if outcome is not None and outcome.is_pending:
+            reference = outcome.reference
+            if reference is not None:
+                self.state.pending_exit_orders[symbol] = reference
+        elif outcome is not None and outcome.is_filled:
+            self.state.pending_exit_orders.pop(symbol, None)
 
     def _equity_positions(self) -> list[Position]:
         """Return positions excluding the configured defensive ETF."""

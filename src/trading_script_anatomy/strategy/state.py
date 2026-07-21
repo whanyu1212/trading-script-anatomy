@@ -14,6 +14,8 @@ class StrategyState:
         target_positions: Latest desired holdings.
         stopped_out: Whether a risk control liquidated equities today.
         stop_loss_etf_bought: Whether defensive cash was invested in the ETF.
+        stop_loss_etf_order_reference: Identifier for an unresolved defensive order.
+        pending_exit_orders: Unresolved risk-exit identifiers by symbol.
         last_rebalance_date: Date of the latest completed weekly rebalance.
     """
 
@@ -22,4 +24,6 @@ class StrategyState:
     target_positions: list[str] = field(default_factory=list)
     stopped_out: bool = False
     stop_loss_etf_bought: bool = False
+    stop_loss_etf_order_reference: str | None = None
+    pending_exit_orders: dict[str, str] = field(default_factory=dict)
     last_rebalance_date: date | None = None

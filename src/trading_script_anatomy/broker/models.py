@@ -11,6 +11,19 @@ class OrderSide(StrEnum):
     SELL = "sell"
 
 
+class OrderOutcomeStatus(StrEnum):
+    """State reached by a synchronous broker order attempt."""
+
+    FILLED = "filled"
+    WORKING = "working"
+    UNKNOWN = "unknown"
+    SKIPPED = "skipped"
+
+
+class BrokerExecutionError(RuntimeError):
+    """Raised when a valid order cannot be executed by a broker."""
+
+
 @dataclass(frozen=True, slots=True)
 class CostModel:
     """Execution costs applied to simulated fills.
@@ -82,3 +95,59 @@ class Order:
     side: OrderSide
     price: float
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class OrderOutcome:
+    """Explicit result of asking a broker to execute an order.
+
+    ``fill`` contains only quantity that the broker has confirmed as executed.
+    A working outcome may carry a partial fill while the remainder stays open.
+    An unknown outcome means submission or final state could not be confirmed;
+    its identifiers must be reconciled before retrying.
+    """
+
+    status: OrderOutcomeStatus
+    order_id: str | None = None
+    client_order_id: str | None = None
+    fill: Order | None = None
+
+    def __post_init__(self) -> None:
+        """Reject internally contradictory execution outcomes."""
+        if self.status is OrderOutcomeStatus.FILLED and self.fill is None:
+            raise ValueError("a filled outcome requires a confirmed fill")
+        if self.status is OrderOutcomeStatus.WORKING and not self.order_id:
+            raise ValueError("a working outcome requires a broker order id")
+        if self.status is OrderOutcomeStatus.UNKNOWN and not (
+            self.order_id or self.client_order_id
+        ):
+            raise ValueError("an unknown outcome requires an order reference")
+        if self.status is OrderOutcomeStatus.SKIPPED and (
+            self.order_id is not None
+            or self.client_order_id is not None
+            or self.fill is not None
+        ):
+            raise ValueError("a skipped outcome cannot contain an order or fill")
+
+    @property
+    def is_filled(self) -> bool:
+        """Return whether the requested order completed in full."""
+        return self.status is OrderOutcomeStatus.FILLED
+
+    @property
+    def is_working(self) -> bool:
+        """Return whether the order remains open at the broker."""
+        return self.status is OrderOutcomeStatus.WORKING
+
+    @property
+    def is_pending(self) -> bool:
+        """Return whether retrying could duplicate a live broker order."""
+        return self.status in {
+            OrderOutcomeStatus.WORKING,
+            OrderOutcomeStatus.UNKNOWN,
+        }
+
+    @property
+    def reference(self) -> str | None:
+        """Return the best identifier available for reconciliation."""
+        return self.order_id or self.client_order_id
