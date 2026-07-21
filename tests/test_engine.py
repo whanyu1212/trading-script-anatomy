@@ -274,8 +274,24 @@ def test_empty_month_waits_for_working_equity_sale_before_safe_etf() -> None:
     assert broker.value_calls == []
 
 
-def test_working_rebalance_purchase_does_not_mark_rebalance_complete() -> None:
-    """Stop dependent buys when the first purchase remains unresolved."""
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        OrderOutcome(OrderOutcomeStatus.WORKING, order_id="buy-1"),
+        OrderOutcome(OrderOutcomeStatus.UNKNOWN, client_order_id="buy-1"),
+        OrderOutcome(
+            OrderOutcomeStatus.PARTIAL,
+            order_id="buy-1",
+            fill=Order(
+                "000001.SZ", 2.0, OrderSide.BUY, 10.0, "rebalance_buy"
+            ),
+        ),
+    ],
+)
+def test_uncertain_rebalance_purchase_stops_later_targets(
+    outcome: OrderOutcome,
+) -> None:
+    """Stop dependent buys when the first purchase may have consumed cash."""
     as_of = date(2025, 6, 3)
     symbols = ("000001.SZ", "000002.SZ")
     data = FakeMarketData(
@@ -294,9 +310,7 @@ def test_working_rebalance_purchase_does_not_mark_rebalance_complete() -> None:
     )
     broker = ScriptedBroker(
         Portfolio(cash=100.0),
-        value_results=(
-            OrderOutcome(OrderOutcomeStatus.WORKING, order_id="buy-1"),
-        ),
+        value_results=(outcome,),
     )
     engine = StrategyEngine(
         StrategyConfig(initial_stock_count=2, finance_candidate_multiplier=1),
@@ -309,6 +323,48 @@ def test_working_rebalance_purchase_does_not_mark_rebalance_complete() -> None:
 
     assert engine.state.target_positions == list(symbols)
     assert len(broker.value_calls) == 1
+    assert engine.state.last_rebalance_date is None
+
+
+def test_failed_rebalance_purchase_does_not_block_later_targets() -> None:
+    """Continue independent purchases after a confirmed zero-fill failure."""
+    as_of = date(2025, 6, 3)
+    symbols = ("000001.SZ", "000002.SZ")
+    data = FakeMarketData(
+        infos={
+            symbol: SecurityInfo(symbol, symbol, date(2023, 1, 1))
+            for symbol in symbols
+        },
+        financials={
+            symbol: FinancialSnapshot(1.5e9, 2e8, 1e7, 1e7)
+            for symbol in symbols
+        },
+        bars={
+            "399106.SZ": bars([100.0] * 10),
+            **{symbol: bars([10.0]) for symbol in symbols},
+        },
+    )
+    fill = Order(symbols[1], 5.0, OrderSide.BUY, 10.0, "rebalance_buy")
+    broker = ScriptedBroker(
+        Portfolio(cash=100.0),
+        value_results=(
+            OrderOutcome(OrderOutcomeStatus.FAILED, order_id="buy-1"),
+            OrderOutcome(OrderOutcomeStatus.FILLED, fill=fill),
+        ),
+    )
+    engine = StrategyEngine(
+        StrategyConfig(initial_stock_count=2, finance_candidate_multiplier=1),
+        data,
+        FakeUniverse(symbols),
+        broker,
+    )
+
+    engine.weekly_rebalance(as_of)
+
+    assert broker.value_calls == [
+        (symbols[0], 50.0, "rebalance_buy"),
+        (symbols[1], 50.0, "rebalance_buy"),
+    ]
     assert engine.state.last_rebalance_date is None
 
 

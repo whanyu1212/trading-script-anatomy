@@ -291,15 +291,23 @@ class StrategyEngine:
                 )
                 completed = False
                 continue
-            if not outcome.is_filled:
-                if outcome.is_pending:
-                    self._logger.warning(
-                        "Rebalance-buy order for %s requires reconciliation as %s",
-                        symbol,
-                        outcome.reference,
-                    )
-                return False
-            completed &= outcome.is_filled
+            if outcome.is_filled:
+                continue
+            completed = False
+            if outcome.status is OrderOutcomeStatus.FAILED:
+                self._logger.error(
+                    "Rebalance-buy order for %s failed as %s",
+                    symbol,
+                    outcome.reference,
+                )
+                continue
+            if outcome.is_pending:
+                self._logger.warning(
+                    "Rebalance-buy order for %s requires reconciliation as %s",
+                    symbol,
+                    outcome.reference,
+                )
+            return False
         return completed
 
     def _sell_safe_etf(self) -> bool:
