@@ -111,3 +111,44 @@ def test_set_price_marks_held_positions_to_market() -> None:
     broker.set_price("S", 12.5)
 
     assert broker.portfolio.positions["S"].last_price == 12.5
+
+
+def test_execution_price_changes_fill_without_marking_position() -> None:
+    """Keep a fill price separate from the strategy-visible market mark."""
+    broker = InMemoryBroker(
+        Portfolio(cash=0.0, positions={"S": Position("S", 10.0, 10.0, 12.0)}),
+        {"S": 12.0},
+    )
+
+    broker.set_execution_price("S", 9.0)
+    assert broker.portfolio.positions["S"].last_price == 12.0
+
+    broker.order_quantity("S", -1.0, "exit")
+
+    assert broker.portfolio.positions["S"].last_price == 9.0
+    assert broker.orders[-1].price == 9.0
+
+
+def test_clearing_execution_prices_prevents_stale_fills() -> None:
+    """Refuse an order rather than reusing a price from an earlier cycle."""
+    broker = InMemoryBroker(
+        Portfolio(cash=0.0, positions={"S": Position("S", 10.0, 10.0, 12.0)}),
+        {"S": 12.0},
+    )
+
+    broker.clear_execution_prices()
+
+    with pytest.raises(ValueError, match="missing positive execution price"):
+        broker.order_quantity("S", -1.0, "exit")
+    assert broker.portfolio.positions["S"].last_price == 12.0
+
+
+@pytest.mark.parametrize(
+    "price", [True, 0.0, -1.0, float("nan"), float("inf"), float("-inf")]
+)
+def test_execution_price_requires_a_positive_finite_number(price: float) -> None:
+    """Reject invalid execution prices before they reach an order."""
+    broker = InMemoryBroker(Portfolio(cash=100.0), {})
+
+    with pytest.raises(ValueError, match="positive and finite"):
+        broker.set_execution_price("S", price)

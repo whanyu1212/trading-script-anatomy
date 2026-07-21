@@ -265,7 +265,7 @@ class Backtester:
         for timestamp in benchmark_bars.index:
             day = timestamp.date()
             self._today = day
-            self._mark_positions(broker, day, "open")
+            self._set_execution_prices(broker, day)
             engine.before_trading_start(day)
             engine.weekly_rebalance(day)
             engine.risk_check(day)
@@ -284,6 +284,14 @@ class Backtester:
             benchmark_curve=pd.Series(benchmark),
             orders=tuple(broker.orders),
         )
+
+    def _set_execution_prices(self, broker: InMemoryBroker, day: date) -> None:
+        """Set day-open fill prices without exposing them to strategy decisions."""
+        broker.clear_execution_prices()
+        for symbol in list(broker.portfolio.positions):
+            price = self._bar_value(symbol, day, "open")
+            if price is not None and price > 0:
+                broker.set_execution_price(symbol, price)
 
     def _mark_positions(
         self, broker: InMemoryBroker, day: date, price_field: str

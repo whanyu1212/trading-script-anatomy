@@ -71,6 +71,7 @@ class StrategyEngine:
         if as_of.weekday() != self.config.rebalance_weekday:
             return
         if self.is_empty_month(as_of):
+            self.handle_empty_month_clear(as_of)
             self.handle_empty_month_etf(as_of)
             return
 
