@@ -1,6 +1,7 @@
 """A deterministic in-memory broker for tests, research, and backtests."""
 
 from collections.abc import Callable, Mapping, Sequence
+import math
 
 from trading_script_anatomy.broker.models import CostModel, Order, OrderSide
 from trading_script_anatomy.portfolio import Portfolio, Position
@@ -45,21 +46,37 @@ class InMemoryBroker:
         return tuple(self._portfolio.positions.values())
 
     def set_price(self, symbol: str, price: float) -> None:
-        """Set the next immediate-fill price for a symbol.
+        """Set a fill price and mark an existing position to that price.
 
         Args:
             symbol: Provider-specific ticker symbol.
             price: Positive execution price per share.
 
         Raises:
-            ValueError: If ``price`` is not positive.
+            ValueError: If ``price`` is not a positive finite number.
         """
-        if price <= 0:
-            raise ValueError("price must be positive")
-        self._prices[symbol] = price
+        self.set_execution_price(symbol, price)
         position = self._portfolio.positions.get(symbol)
         if position is not None:
             position.last_price = price
+
+    def set_execution_price(self, symbol: str, price: float) -> None:
+        """Set a fill price without changing a held position's market mark.
+
+        Args:
+            symbol: Provider-specific ticker symbol.
+            price: Positive execution price per share.
+
+        Raises:
+            ValueError: If ``price`` is not a positive finite number.
+        """
+        if isinstance(price, bool) or not math.isfinite(price) or price <= 0:
+            raise ValueError("price must be positive and finite")
+        self._prices[symbol] = price
+
+    def clear_execution_prices(self) -> None:
+        """Remove all immediate-fill prices from the previous execution cycle."""
+        self._prices.clear()
 
     def order_quantity(self, symbol: str, quantity: float, reason: str) -> None:
         """Execute a signed quantity order at the configured price.
@@ -140,6 +157,11 @@ class InMemoryBroker:
         price = self._prices.get(symbol)
         if price is None and self._price_resolver is not None:
             price = self._price_resolver(symbol)
-        if price is None or price <= 0:
+        if (
+            price is None
+            or isinstance(price, bool)
+            or not math.isfinite(price)
+            or price <= 0
+        ):
             raise ValueError(f"missing positive execution price for {symbol}")
         return price

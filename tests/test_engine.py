@@ -6,7 +6,7 @@ from trading_script_anatomy.broker.memory import InMemoryBroker
 from trading_script_anatomy.config import StrategyConfig
 from trading_script_anatomy.engine import StrategyEngine
 from trading_script_anatomy.data.models import FinancialSnapshot, SecurityInfo
-from trading_script_anatomy.portfolio import Portfolio
+from trading_script_anatomy.portfolio import Portfolio, Position
 from trading_script_anatomy.strategy.state import StrategyState
 
 from tests.fakes import FakeMarketData, FakeUniverse, bars
@@ -89,3 +89,36 @@ def test_stop_loss_funds_move_to_safe_etf_after_two_pm() -> None:
     assert broker.portfolio.positions["511880.SS"].quantity == 100.0
     assert engine.state.stop_loss_etf_bought is True
     assert engine.state.stopped_out is False
+
+
+def test_empty_month_rebalance_sells_equities_before_buying_safe_etf() -> None:
+    """Move invested capital directly into the defensive asset."""
+    config = StrategyConfig(empty_months=(4,))
+    broker = InMemoryBroker(
+        Portfolio(
+            cash=20.0,
+            positions={
+                "000001.SZ": Position("000001.SZ", 10.0, 10.0, 10.0),
+                config.safe_etf_symbol: Position(
+                    config.safe_etf_symbol, 5.0, 1.0, 1.0
+                ),
+            },
+        ),
+        {"000001.SZ": 10.0, config.safe_etf_symbol: 1.0},
+    )
+    engine = StrategyEngine(
+        config,
+        FakeMarketData(),
+        FakeUniverse(()),
+        broker,
+    )
+
+    engine.weekly_rebalance(date(2025, 4, 1))
+
+    assert [order.reason for order in broker.orders] == [
+        "empty_month_clear",
+        "buy_safe_etf",
+    ]
+    assert broker.portfolio.cash == 0.0
+    assert set(broker.portfolio.positions) == {config.safe_etf_symbol}
+    assert broker.portfolio.positions[config.safe_etf_symbol].quantity == 125.0
