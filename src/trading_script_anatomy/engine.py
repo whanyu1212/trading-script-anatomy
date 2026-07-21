@@ -75,6 +75,8 @@ class StrategyEngine:
         """
         if as_of.weekday() != self.config.rebalance_weekday:
             return
+        if not self._reconcile_pending_weekly_sales():
+            return
         if self.is_empty_month(as_of):
             if self.handle_empty_month_clear(as_of):
                 self.handle_empty_month_etf(as_of)
@@ -113,6 +115,21 @@ class StrategyEngine:
 
         sold_any = self._reconcile_pending_exits()
         attempted_symbols = set(self.state.pending_exit_orders)
+        for symbol, reason in list(self.state.incomplete_exit_reasons.items()):
+            if symbol in attempted_symbols:
+                continue
+            position = self._position(symbol)
+            if position is None or position.quantity <= 0:
+                self.state.incomplete_exit_reasons.pop(symbol, None)
+                continue
+            attempted_symbols.add(symbol)
+            outcome = self._sell(
+                symbol,
+                position.quantity,
+                reason,
+            )
+            self._track_risk_exit(symbol, reason, outcome)
+            sold_any |= self._is_filled(outcome)
         for instruction in self._risk.position_exit_orders(
             self._equity_positions(), as_of
         ):
@@ -124,7 +141,9 @@ class StrategyEngine:
                 instruction.quantity,
                 instruction.reason,
             )
-            self._track_risk_exit(instruction.symbol, outcome)
+            self._track_risk_exit(
+                instruction.symbol, instruction.reason, outcome
+            )
             sold_any |= self._is_filled(outcome)
 
         if self._risk.market_stop_loss_triggered(as_of):
@@ -137,7 +156,9 @@ class StrategyEngine:
                     position.quantity,
                     "market_stop_loss",
                 )
-                self._track_risk_exit(position.symbol, outcome)
+                self._track_risk_exit(
+                    position.symbol, "market_stop_loss", outcome
+                )
                 sold_any |= self._is_filled(outcome)
 
         if sold_any:
@@ -157,7 +178,9 @@ class StrategyEngine:
         completed = True
         for position in self._equity_positions():
             completed &= self._is_filled(
-                self._sell(position.symbol, position.quantity, "empty_month_clear")
+                self._sell_weekly(
+                    position.symbol, position.quantity, "empty_month_clear"
+                )
             )
         return completed
 
@@ -187,6 +210,7 @@ class StrategyEngine:
             and not self.state.stop_loss_etf_bought
             and self.state.stop_loss_etf_order_reference is None
             and not self.state.pending_exit_orders
+            and not self.state.incomplete_exit_reasons
             and now.hour >= 14
         ):
             outcome = self._buy_safe_etf()
@@ -257,7 +281,7 @@ class StrategyEngine:
         for position in self._equity_positions():
             if position.symbol not in target_set:
                 completed &= self._is_filled(
-                    self._sell(
+                    self._sell_weekly(
                         position.symbol,
                         position.quantity,
                         "rebalance_sell",
@@ -316,7 +340,7 @@ class StrategyEngine:
         if position is None or position.quantity <= 0:
             return True
         return self._is_filled(
-            self._sell(
+            self._sell_weekly(
                 self.config.safe_etf_symbol,
                 position.quantity,
                 "sell_safe_etf",
@@ -350,15 +374,67 @@ class StrategyEngine:
         return outcome is not None and outcome.is_filled
 
     def _track_risk_exit(
-        self, symbol: str, outcome: OrderOutcome | None
+        self,
+        symbol: str,
+        reason: str,
+        outcome: OrderOutcome | None,
     ) -> None:
-        """Prevent duplicate risk exits while a broker order remains open."""
+        """Track live risk orders and any liquidation still requiring a retry."""
+        if outcome is not None and outcome.is_filled:
+            self.state.pending_exit_orders.pop(symbol, None)
+            self.state.incomplete_exit_reasons.pop(symbol, None)
+            return
+        if self._position(symbol) is None:
+            self.state.pending_exit_orders.pop(symbol, None)
+            self.state.incomplete_exit_reasons.pop(symbol, None)
+            return
+        self.state.incomplete_exit_reasons[symbol] = reason
         if outcome is not None and outcome.is_pending:
             reference = outcome.reference
             if reference is not None:
                 self.state.pending_exit_orders[symbol] = reference
-        elif outcome is not None:
+        else:
             self.state.pending_exit_orders.pop(symbol, None)
+
+    def _sell_weekly(
+        self, symbol: str, quantity: float, reason: str
+    ) -> OrderOutcome | None:
+        """Submit a weekly sale and retain references that need reconciliation."""
+        outcome = self._sell(symbol, quantity, reason)
+        if outcome is not None and outcome.is_pending:
+            reference = outcome.reference
+            if reference is not None:
+                self.state.pending_weekly_sale_orders[symbol] = reference
+        elif outcome is not None:
+            self.state.pending_weekly_sale_orders.pop(symbol, None)
+        return outcome
+
+    def _reconcile_pending_weekly_sales(self) -> bool:
+        """Refresh weekly sales and block sequencing while any remain open."""
+        completed = True
+        for symbol, reference in list(
+            self.state.pending_weekly_sale_orders.items()
+        ):
+            try:
+                outcome = self.broker.reconcile_order(reference)
+            except BrokerExecutionError as error:
+                self._logger.error(
+                    "Unable to reconcile weekly sale %s for %s: %s",
+                    reference,
+                    symbol,
+                    error,
+                )
+                completed = False
+                continue
+            if outcome.is_pending:
+                if outcome.reference is not None:
+                    self.state.pending_weekly_sale_orders[symbol] = (
+                        outcome.reference
+                    )
+                completed = False
+                continue
+            self.state.pending_weekly_sale_orders.pop(symbol, None)
+        return completed
 
     def _reconcile_pending_exits(self) -> bool:
         """Refresh unresolved exits and return whether any shares filled."""
@@ -375,11 +451,20 @@ class StrategyEngine:
                 )
                 continue
             if outcome.is_pending:
+                self.state.incomplete_exit_reasons.setdefault(
+                    symbol, "risk_exit_retry"
+                )
                 if outcome.reference is not None:
                     self.state.pending_exit_orders[symbol] = outcome.reference
                 continue
-            self.state.pending_exit_orders.pop(symbol, None)
             filled_any |= outcome.has_fill
+            self.state.pending_exit_orders.pop(symbol, None)
+            if outcome.is_filled or self._position(symbol) is None:
+                self.state.incomplete_exit_reasons.pop(symbol, None)
+            else:
+                self.state.incomplete_exit_reasons.setdefault(
+                    symbol, "risk_exit_retry"
+                )
         return filled_any
 
     def _reconcile_safe_etf_order(self) -> None:

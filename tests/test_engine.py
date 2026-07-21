@@ -396,6 +396,161 @@ def test_working_safe_etf_sale_blocks_a_repurchase() -> None:
     assert broker.value_calls == []
 
 
+def test_weekly_rebalance_reconciles_safe_etf_sale_before_buying() -> None:
+    """Resume a weekly rebalance without duplicating an unresolved ETF sale."""
+    as_of = date(2025, 6, 3)
+    symbol = "000001.SZ"
+    config = StrategyConfig(
+        initial_stock_count=1, finance_candidate_multiplier=1
+    )
+    data = FakeMarketData(
+        infos={symbol: SecurityInfo(symbol, symbol, date(2023, 1, 1))},
+        financials={symbol: FinancialSnapshot(1.5e9, 2e8, 1e7, 1e7)},
+        bars={
+            config.benchmark_symbol: bars([100.0] * 10),
+            symbol: bars([10.0]),
+        },
+    )
+    sale_fill = Order(
+        config.safe_etf_symbol, 5.0, OrderSide.SELL, 1.0, "sell_safe_etf"
+    )
+    buy_fill = Order(symbol, 10.0, OrderSide.BUY, 10.0, "rebalance_buy")
+    portfolio = Portfolio(
+        cash=20.0,
+        positions={
+            config.safe_etf_symbol: Position(
+                config.safe_etf_symbol, 5.0, 1.0, 1.0
+            )
+        },
+    )
+    broker = ScriptedBroker(
+        portfolio,
+        quantity_results=(
+            OrderOutcome(OrderOutcomeStatus.WORKING, order_id="sell-safe-1"),
+        ),
+        value_results=(
+            OrderOutcome(OrderOutcomeStatus.FILLED, fill=buy_fill),
+        ),
+        reconcile_results=(
+            OrderOutcome(
+                OrderOutcomeStatus.FILLED,
+                order_id="sell-safe-1",
+                fill=sale_fill,
+            ),
+        ),
+    )
+    engine = StrategyEngine(
+        config, data, FakeUniverse((symbol,)), broker
+    )
+
+    engine.weekly_rebalance(as_of)
+
+    assert engine.state.pending_weekly_sale_orders == {
+        config.safe_etf_symbol: "sell-safe-1"
+    }
+    assert broker.value_calls == []
+
+    portfolio.positions.clear()
+    portfolio.cash = 100.0
+    engine.weekly_rebalance(as_of)
+
+    assert broker.quantity_calls == [
+        (config.safe_etf_symbol, -5.0, "sell_safe_etf")
+    ]
+    assert broker.reconcile_calls == ["sell-safe-1"]
+    assert broker.value_calls == [(symbol, 100.0, "rebalance_buy")]
+    assert engine.state.pending_weekly_sale_orders == {}
+    assert engine.state.last_rebalance_date == as_of
+
+
+def test_weekly_rebalance_reconciles_non_target_sale_before_buying() -> None:
+    """Do not duplicate a non-target sale while its outcome remains open."""
+    as_of = date(2025, 6, 3)
+    old_symbol = "000001.SZ"
+    target_symbol = "000002.SZ"
+    config = StrategyConfig(
+        initial_stock_count=1, finance_candidate_multiplier=1
+    )
+    data = FakeMarketData(
+        infos={
+            target_symbol: SecurityInfo(
+                target_symbol, target_symbol, date(2023, 1, 1)
+            )
+        },
+        financials={
+            target_symbol: FinancialSnapshot(1.5e9, 2e8, 1e7, 1e7)
+        },
+        bars={
+            config.benchmark_symbol: bars([100.0] * 10),
+            target_symbol: bars([10.0]),
+        },
+    )
+    portfolio = Portfolio(
+        cash=0.0,
+        positions={
+            old_symbol: Position(old_symbol, 10.0, 10.0, 10.0),
+        },
+    )
+    broker = ScriptedBroker(
+        portfolio,
+        quantity_results=(
+            OrderOutcome(OrderOutcomeStatus.WORKING, order_id="sell-old-1"),
+        ),
+        value_results=(
+            OrderOutcome(
+                OrderOutcomeStatus.FILLED,
+                fill=Order(
+                    target_symbol,
+                    10.0,
+                    OrderSide.BUY,
+                    10.0,
+                    "rebalance_buy",
+                ),
+            ),
+        ),
+        reconcile_results=(
+            OrderOutcome(OrderOutcomeStatus.WORKING, order_id="sell-old-1"),
+            OrderOutcome(
+                OrderOutcomeStatus.FILLED,
+                order_id="sell-old-1",
+                fill=Order(
+                    old_symbol,
+                    10.0,
+                    OrderSide.SELL,
+                    10.0,
+                    "rebalance_sell",
+                ),
+            ),
+        ),
+    )
+    engine = StrategyEngine(
+        config, data, FakeUniverse((target_symbol,)), broker
+    )
+
+    engine.weekly_rebalance(as_of)
+    engine.weekly_rebalance(as_of)
+
+    assert broker.quantity_calls == [
+        (old_symbol, -10.0, "rebalance_sell")
+    ]
+    assert broker.value_calls == []
+    assert engine.state.pending_weekly_sale_orders == {
+        old_symbol: "sell-old-1"
+    }
+
+    portfolio.positions.clear()
+    portfolio.cash = 100.0
+    engine.weekly_rebalance(as_of)
+
+    assert broker.quantity_calls == [
+        (old_symbol, -10.0, "rebalance_sell")
+    ]
+    assert broker.reconcile_calls == ["sell-old-1", "sell-old-1"]
+    assert broker.value_calls == [(target_symbol, 100.0, "rebalance_buy")]
+    assert engine.state.pending_weekly_sale_orders == {}
+    assert engine.state.last_rebalance_date == as_of
+
+
 def test_risk_check_does_not_duplicate_a_working_exit() -> None:
     """Submit at most one live sell per symbol across repeated daily checks."""
     symbol = "000001.SZ"
@@ -423,6 +578,7 @@ def test_risk_check_does_not_duplicate_a_working_exit() -> None:
 
     assert broker.quantity_calls == [(symbol, -10.0, "stop_loss")]
     assert engine.state.pending_exit_orders == {symbol: "sell-1"}
+    assert engine.state.incomplete_exit_reasons == {symbol: "stop_loss"}
     assert engine.state.stopped_out is False
 
 
@@ -456,8 +612,9 @@ def test_terminal_pending_exit_is_released_and_retried() -> None:
     engine.risk_check(date(2025, 6, 3))
 
     assert broker.reconcile_calls == ["sell-1"]
-    assert broker.quantity_calls == [(symbol, -10.0, "stop_loss")]
+    assert broker.quantity_calls == [(symbol, -10.0, "risk_exit_retry")]
     assert state.pending_exit_orders == {symbol: "sell-2"}
+    assert state.incomplete_exit_reasons == {symbol: "risk_exit_retry"}
 
 
 def test_defensive_buy_waits_for_every_pending_exit() -> None:
@@ -511,12 +668,69 @@ def test_defensive_buy_waits_for_every_pending_exit() -> None:
     assert state.stopped_out is False
 
 
+@pytest.mark.parametrize(
+    "terminal_outcome",
+    [
+        OrderOutcome(OrderOutcomeStatus.FAILED, order_id="sell-1"),
+        OrderOutcome(
+            OrderOutcomeStatus.PARTIAL,
+            order_id="sell-1",
+            fill=Order(
+                "000001.SZ", 5.0, OrderSide.SELL, 8.0, "stop_loss"
+            ),
+        ),
+    ],
+)
+def test_incomplete_pending_exit_blocks_defensive_buy_until_risk_retry(
+    terminal_outcome: OrderOutcome,
+) -> None:
+    """Keep held equity as a barrier after its pending sale terminates."""
+    symbol = "000001.SZ"
+    broker = ScriptedBroker(
+        Portfolio(
+            cash=90.0,
+            positions={symbol: Position(symbol, 10.0, 10.0, 8.0)},
+        ),
+        quantity_results=(
+            OrderOutcome(OrderOutcomeStatus.WORKING, order_id="sell-2"),
+        ),
+        reconcile_results=(terminal_outcome,),
+    )
+    state = StrategyState(
+        stock_count=1,
+        stopped_out=True,
+        pending_exit_orders={symbol: "sell-1"},
+        incomplete_exit_reasons={symbol: "stop_loss"},
+    )
+    engine = StrategyEngine(
+        StrategyConfig(),
+        FakeMarketData(),
+        FakeUniverse(()),
+        broker,
+        state=state,
+    )
+
+    engine.handle_stop_loss_funds(datetime(2025, 6, 3, 14, 0))
+
+    assert broker.value_calls == []
+    assert state.pending_exit_orders == {}
+    assert state.incomplete_exit_reasons == {symbol: "stop_loss"}
+
+    engine.risk_check(date(2025, 6, 3))
+
+    assert broker.quantity_calls == [(symbol, -10.0, "stop_loss")]
+    assert state.pending_exit_orders == {symbol: "sell-2"}
+    assert state.incomplete_exit_reasons == {symbol: "stop_loss"}
+
+
 def test_daily_reset_preserves_unresolved_order_references() -> None:
     """Require reconciliation instead of permitting next-day duplicates."""
     state = StrategyState(
         stock_count=1,
         stop_loss_etf_order_reference="safe-1",
         pending_exit_orders={"000001.SZ": "sell-1"},
+        incomplete_exit_reasons={"000001.SZ": "stop_loss"},
+        pending_weekly_sale_orders={"511880.SS": "weekly-1"},
     )
     engine = StrategyEngine(
         StrategyConfig(),
@@ -530,3 +744,5 @@ def test_daily_reset_preserves_unresolved_order_references() -> None:
 
     assert state.stop_loss_etf_order_reference == "safe-1"
     assert state.pending_exit_orders == {"000001.SZ": "sell-1"}
+    assert state.incomplete_exit_reasons == {"000001.SZ": "stop_loss"}
+    assert state.pending_weekly_sale_orders == {"511880.SS": "weekly-1"}
