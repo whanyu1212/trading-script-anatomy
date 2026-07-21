@@ -75,7 +75,7 @@ class StrategyEngine:
         """
         if as_of.weekday() != self.config.rebalance_weekday:
             return
-        if not self._reconcile_pending_weekly_sales():
+        if not self._weekly_order_flow_ready():
             return
         if self.is_empty_month(as_of):
             if self.handle_empty_month_clear(as_of):
@@ -92,7 +92,7 @@ class StrategyEngine:
         )
         if not target_symbols:
             if safe_etf_sale_completed:
-                self._buy_safe_etf()
+                self._buy_safe_etf_weekly()
             self.state.target_positions = []
             return
 
@@ -113,8 +113,14 @@ class StrategyEngine:
         if self.is_empty_month(as_of):
             return
 
+        self._reconcile_pending_weekly_sales()
+        self._reconcile_pending_weekly_buys()
         sold_any = self._reconcile_pending_exits()
-        attempted_symbols = set(self.state.pending_exit_orders)
+        attempted_symbols = (
+            set(self.state.pending_exit_orders)
+            | set(self.state.pending_weekly_sale_orders)
+            | set(self.state.pending_weekly_buy_orders)
+        )
         for symbol, reason in list(self.state.incomplete_exit_reasons.items()):
             if symbol in attempted_symbols:
                 continue
@@ -175,6 +181,8 @@ class StrategyEngine:
         """
         if not self.is_empty_month(as_of):
             return True
+        if not self._weekly_order_flow_ready():
+            return False
         completed = True
         for position in self._equity_positions():
             completed &= self._is_filled(
@@ -193,8 +201,9 @@ class StrategyEngine:
         if (
             self.is_empty_month(as_of)
             and as_of.weekday() == self.config.rebalance_weekday
+            and self._weekly_order_flow_ready()
         ):
-            self._buy_safe_etf()
+            self._buy_safe_etf_weekly()
 
     def handle_stop_loss_funds(self, now: datetime) -> None:
         """Invest post-risk-sale cash in the safe ETF after 14:00.
@@ -203,6 +212,8 @@ class StrategyEngine:
             now: Current timestamp in the trading calendar's timezone.
         """
         self._reconcile_safe_etf_order()
+        self._reconcile_pending_weekly_sales()
+        self._reconcile_pending_weekly_buys()
         if self._reconcile_pending_exits():
             self.state.stopped_out = True
         if (
@@ -211,6 +222,8 @@ class StrategyEngine:
             and self.state.stop_loss_etf_order_reference is None
             and not self.state.pending_exit_orders
             and not self.state.incomplete_exit_reasons
+            and not self.state.pending_weekly_sale_orders
+            and not self.state.pending_weekly_buy_orders
             and now.hour >= 14
         ):
             outcome = self._buy_safe_etf()
@@ -313,8 +326,10 @@ class StrategyEngine:
                 self._logger.error(
                     "Unable to rebalance-buy %s: %s", symbol, error
                 )
+                self.state.pending_weekly_buy_orders.pop(symbol, None)
                 completed = False
                 continue
+            self._track_weekly_buy(symbol, outcome)
             if outcome.is_filled:
                 continue
             completed = False
@@ -368,6 +383,12 @@ class StrategyEngine:
             )
         return outcome
 
+    def _buy_safe_etf_weekly(self) -> OrderOutcome | None:
+        """Buy the safe ETF and retain a weekly order requiring reconciliation."""
+        outcome = self._buy_safe_etf()
+        self._track_weekly_buy(self.config.safe_etf_symbol, outcome)
+        return outcome
+
     @staticmethod
     def _is_filled(outcome: OrderOutcome | None) -> bool:
         """Return whether a broker operation produced a completed fill."""
@@ -409,6 +430,35 @@ class StrategyEngine:
             self.state.pending_weekly_sale_orders.pop(symbol, None)
         return outcome
 
+    def _track_weekly_buy(
+        self, symbol: str, outcome: OrderOutcome | None
+    ) -> None:
+        """Retain a weekly purchase reference only while execution is pending."""
+        if outcome is not None and outcome.is_pending:
+            reference = outcome.reference
+            if reference is not None:
+                self.state.pending_weekly_buy_orders[symbol] = reference
+        elif outcome is not None:
+            self.state.pending_weekly_buy_orders.pop(symbol, None)
+
+    def _weekly_order_flow_ready(self) -> bool:
+        """Reconcile cross-lifecycle orders before submitting weekly orders."""
+        if not self._reconcile_pending_weekly_sales():
+            return False
+        if not self._reconcile_pending_weekly_buys():
+            return False
+        had_risk_exit = bool(
+            self.state.pending_exit_orders
+            or self.state.incomplete_exit_reasons
+        )
+        if self._reconcile_pending_exits():
+            self.state.stopped_out = True
+        return not (
+            had_risk_exit
+            or self.state.pending_exit_orders
+            or self.state.incomplete_exit_reasons
+        )
+
     def _reconcile_pending_weekly_sales(self) -> bool:
         """Refresh weekly sales and block sequencing while any remain open."""
         completed = True
@@ -434,6 +484,33 @@ class StrategyEngine:
                 completed = False
                 continue
             self.state.pending_weekly_sale_orders.pop(symbol, None)
+        return completed
+
+    def _reconcile_pending_weekly_buys(self) -> bool:
+        """Refresh weekly buys and block new orders while any remain open."""
+        completed = True
+        for symbol, reference in list(
+            self.state.pending_weekly_buy_orders.items()
+        ):
+            try:
+                outcome = self.broker.reconcile_order(reference)
+            except BrokerExecutionError as error:
+                self._logger.error(
+                    "Unable to reconcile weekly buy %s for %s: %s",
+                    reference,
+                    symbol,
+                    error,
+                )
+                completed = False
+                continue
+            if outcome.is_pending:
+                if outcome.reference is not None:
+                    self.state.pending_weekly_buy_orders[symbol] = (
+                        outcome.reference
+                    )
+                completed = False
+                continue
+            self.state.pending_weekly_buy_orders.pop(symbol, None)
         return completed
 
     def _reconcile_pending_exits(self) -> bool:
