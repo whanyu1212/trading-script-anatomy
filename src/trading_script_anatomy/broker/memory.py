@@ -85,6 +85,14 @@ class InMemoryBroker:
         """Remove all immediate-fill prices from the previous execution cycle."""
         self._prices.clear()
 
+    def reconcile_order(self, reference: str) -> OrderOutcome:
+        """Reject reconciliation because simulated orders never remain open."""
+        if not reference.strip():
+            raise ValueError("order reference must not be empty")
+        raise BrokerExecutionError(
+            f"in-memory broker has no unresolved order {reference}"
+        )
+
     def order_quantity(
         self, symbol: str, quantity: float, reason: str
     ) -> OrderOutcome:

@@ -111,7 +111,7 @@ class StrategyEngine:
         if self.is_empty_month(as_of):
             return
 
-        sold_any = False
+        sold_any = self._reconcile_pending_exits()
         attempted_symbols = set(self.state.pending_exit_orders)
         for instruction in self._risk.position_exit_orders(
             self._equity_positions(), as_of
@@ -179,10 +179,14 @@ class StrategyEngine:
         Args:
             now: Current timestamp in the trading calendar's timezone.
         """
+        self._reconcile_safe_etf_order()
+        if self._reconcile_pending_exits():
+            self.state.stopped_out = True
         if (
             self.state.stopped_out
             and not self.state.stop_loss_etf_bought
             and self.state.stop_loss_etf_order_reference is None
+            and not self.state.pending_exit_orders
             and now.hour >= 14
         ):
             outcome = self._buy_safe_etf()
@@ -190,11 +194,13 @@ class StrategyEngine:
                 outcome is not None
                 and outcome.status is not OrderOutcomeStatus.SKIPPED
             ):
-                self.state.stop_loss_etf_bought = outcome.is_filled
-                self.state.stop_loss_etf_order_reference = (
-                    outcome.reference if outcome.is_pending else None
-                )
-                self.state.stopped_out = False
+                if outcome.is_filled:
+                    self.state.stop_loss_etf_bought = True
+                    self.state.stop_loss_etf_order_reference = None
+                    self.state.stopped_out = False
+                elif outcome.is_pending:
+                    self.state.stop_loss_etf_order_reference = outcome.reference
+                    self.state.stopped_out = False
 
     def handle_data(self, now: datetime) -> None:
         """Run the intraday action formerly called by PTrade.
@@ -285,12 +291,13 @@ class StrategyEngine:
                 )
                 completed = False
                 continue
-            if outcome.is_pending:
-                self._logger.warning(
-                    "Rebalance-buy order for %s requires reconciliation as %s",
-                    symbol,
-                    outcome.reference,
-                )
+            if not outcome.is_filled:
+                if outcome.is_pending:
+                    self._logger.warning(
+                        "Rebalance-buy order for %s requires reconciliation as %s",
+                        symbol,
+                        outcome.reference,
+                    )
                 return False
             completed &= outcome.is_filled
         return completed
@@ -342,8 +349,49 @@ class StrategyEngine:
             reference = outcome.reference
             if reference is not None:
                 self.state.pending_exit_orders[symbol] = reference
-        elif outcome is not None and outcome.is_filled:
+        elif outcome is not None:
             self.state.pending_exit_orders.pop(symbol, None)
+
+    def _reconcile_pending_exits(self) -> bool:
+        """Refresh unresolved exits and return whether any shares filled."""
+        filled_any = False
+        for symbol, reference in list(self.state.pending_exit_orders.items()):
+            try:
+                outcome = self.broker.reconcile_order(reference)
+            except BrokerExecutionError as error:
+                self._logger.error(
+                    "Unable to reconcile risk exit %s for %s: %s",
+                    reference,
+                    symbol,
+                    error,
+                )
+                continue
+            if outcome.is_pending:
+                if outcome.reference is not None:
+                    self.state.pending_exit_orders[symbol] = outcome.reference
+                continue
+            self.state.pending_exit_orders.pop(symbol, None)
+            filled_any |= outcome.has_fill
+        return filled_any
+
+    def _reconcile_safe_etf_order(self) -> None:
+        """Refresh an unresolved defensive order before considering a retry."""
+        reference = self.state.stop_loss_etf_order_reference
+        if reference is None:
+            return
+        try:
+            outcome = self.broker.reconcile_order(reference)
+        except BrokerExecutionError as error:
+            self._logger.error(
+                "Unable to reconcile safe ETF order %s: %s", reference, error
+            )
+            return
+        if outcome.is_pending:
+            self.state.stop_loss_etf_order_reference = outcome.reference
+            return
+        self.state.stop_loss_etf_order_reference = None
+        self.state.stop_loss_etf_bought = outcome.is_filled
+        self.state.stopped_out = not outcome.is_filled
 
     def _equity_positions(self) -> list[Position]:
         """Return positions excluding the configured defensive ETF."""

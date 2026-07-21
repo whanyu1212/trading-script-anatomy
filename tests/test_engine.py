@@ -7,8 +7,10 @@ import pytest
 from trading_script_anatomy.broker.memory import InMemoryBroker
 from trading_script_anatomy.broker.models import (
     BrokerExecutionError,
+    Order,
     OrderOutcome,
     OrderOutcomeStatus,
+    OrderSide,
 )
 from trading_script_anatomy.config import StrategyConfig
 from trading_script_anatomy.engine import StrategyEngine
@@ -28,12 +30,15 @@ class ScriptedBroker:
         *,
         quantity_results: tuple[OrderOutcome | BaseException, ...] = (),
         value_results: tuple[OrderOutcome | BaseException, ...] = (),
+        reconcile_results: tuple[OrderOutcome | BaseException, ...] = (),
     ) -> None:
         self.portfolio = portfolio
         self._quantity_results = list(quantity_results)
         self._value_results = list(value_results)
+        self._reconcile_results = list(reconcile_results)
         self.quantity_calls: list[tuple[str, float, str]] = []
         self.value_calls: list[tuple[str, float, str]] = []
+        self.reconcile_calls: list[str] = []
 
     def positions(self) -> tuple[Position, ...]:
         """Return the configured portfolio positions."""
@@ -50,6 +55,11 @@ class ScriptedBroker:
         """Return the next scripted value-order response."""
         self.value_calls.append((symbol, value, reason))
         return self._next(self._value_results)
+
+    def reconcile_order(self, reference: str) -> OrderOutcome:
+        """Return the next scripted reconciliation response."""
+        self.reconcile_calls.append(reference)
+        return self._next(self._reconcile_results)
 
     @staticmethod
     def _next(results: list[OrderOutcome | BaseException]) -> OrderOutcome:
@@ -192,6 +202,7 @@ def test_pending_stop_loss_etf_order_is_not_submitted_twice(
     broker = ScriptedBroker(
         Portfolio(cash=100.0),
         value_results=(outcome,),
+        reconcile_results=(outcome,),
     )
     engine = StrategyEngine(
         StrategyConfig(), FakeMarketData(), FakeUniverse(()), broker
@@ -341,6 +352,9 @@ def test_risk_check_does_not_duplicate_a_working_exit() -> None:
         quantity_results=(
             OrderOutcome(OrderOutcomeStatus.WORKING, order_id="sell-1"),
         ),
+        reconcile_results=(
+            OrderOutcome(OrderOutcomeStatus.WORKING, order_id="sell-1"),
+        ),
     )
     data = FakeMarketData(
         bars={config.benchmark_symbol: bars([90.0], [100.0])}
@@ -354,6 +368,91 @@ def test_risk_check_does_not_duplicate_a_working_exit() -> None:
     assert broker.quantity_calls == [(symbol, -10.0, "stop_loss")]
     assert engine.state.pending_exit_orders == {symbol: "sell-1"}
     assert engine.state.stopped_out is False
+
+
+def test_terminal_pending_exit_is_released_and_retried() -> None:
+    """Resume risk protection after an earlier unresolved order expires."""
+    symbol = "000001.SZ"
+    broker = ScriptedBroker(
+        Portfolio(
+            cash=0.0,
+            positions={symbol: Position(symbol, 10.0, 10.0, 8.0)},
+        ),
+        quantity_results=(
+            OrderOutcome(OrderOutcomeStatus.WORKING, order_id="sell-2"),
+        ),
+        reconcile_results=(
+            OrderOutcome(OrderOutcomeStatus.FAILED, order_id="sell-1"),
+        ),
+    )
+    state = StrategyState(
+        stock_count=1,
+        pending_exit_orders={symbol: "sell-1"},
+    )
+    engine = StrategyEngine(
+        StrategyConfig(),
+        FakeMarketData(),
+        FakeUniverse(()),
+        broker,
+        state=state,
+    )
+
+    engine.risk_check(date(2025, 6, 3))
+
+    assert broker.reconcile_calls == ["sell-1"]
+    assert broker.quantity_calls == [(symbol, -10.0, "stop_loss")]
+    assert state.pending_exit_orders == {symbol: "sell-2"}
+
+
+def test_defensive_buy_waits_for_every_pending_exit() -> None:
+    """Sweep proceeds only after all unresolved risk sales have settled."""
+    first_fill = Order("S1", 10.0, OrderSide.SELL, 9.0, "stop_loss")
+    second_fill = Order("S2", 10.0, OrderSide.SELL, 9.0, "stop_loss")
+    etf_fill = Order("511880.SS", 180.0, OrderSide.BUY, 1.0, "buy_safe_etf")
+    broker = ScriptedBroker(
+        Portfolio(cash=180.0),
+        value_results=(
+            OrderOutcome(OrderOutcomeStatus.FILLED, fill=etf_fill),
+        ),
+        reconcile_results=(
+            OrderOutcome(
+                OrderOutcomeStatus.FILLED,
+                order_id="sell-1",
+                fill=first_fill,
+            ),
+            OrderOutcome(OrderOutcomeStatus.WORKING, order_id="sell-2"),
+            OrderOutcome(
+                OrderOutcomeStatus.FILLED,
+                order_id="sell-2",
+                fill=second_fill,
+            ),
+        ),
+    )
+    state = StrategyState(
+        stock_count=2,
+        stopped_out=True,
+        pending_exit_orders={"S1": "sell-1", "S2": "sell-2"},
+    )
+    engine = StrategyEngine(
+        StrategyConfig(),
+        FakeMarketData(),
+        FakeUniverse(()),
+        broker,
+        state=state,
+    )
+    now = datetime(2025, 6, 3, 14, 0)
+
+    engine.handle_stop_loss_funds(now)
+
+    assert broker.value_calls == []
+    assert state.pending_exit_orders == {"S2": "sell-2"}
+
+    engine.handle_stop_loss_funds(now)
+
+    assert len(broker.value_calls) == 1
+    assert state.pending_exit_orders == {}
+    assert state.stop_loss_etf_bought is True
+    assert state.stopped_out is False
 
 
 def test_daily_reset_preserves_unresolved_order_references() -> None:

@@ -31,7 +31,8 @@ class Broker(Protocol):
             reason: Strategy event that triggered the order.
 
         Returns:
-            Explicit filled, working, unknown, or skipped outcome.
+            Explicit filled, partial, failed, working, unknown, or skipped
+            outcome.
         """
 
     def order_value(self, symbol: str, value: float, reason: str) -> OrderOutcome:
@@ -43,5 +44,16 @@ class Broker(Protocol):
             reason: Strategy event that triggered the order.
 
         Returns:
-            Explicit filled, working, or unknown outcome.
+            Explicit filled, partial, failed, working, or unknown outcome.
+        """
+
+    def reconcile_order(self, reference: str) -> OrderOutcome:
+        """Refresh a previously unresolved order.
+
+        Args:
+            reference: Broker or client order identifier from an earlier
+                outcome.
+
+        Returns:
+            Current explicit execution outcome.
         """

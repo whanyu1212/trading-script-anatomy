@@ -15,6 +15,8 @@ class OrderOutcomeStatus(StrEnum):
     """State reached by a synchronous broker order attempt."""
 
     FILLED = "filled"
+    PARTIAL = "partial"
+    FAILED = "failed"
     WORKING = "working"
     UNKNOWN = "unknown"
     SKIPPED = "skipped"
@@ -103,6 +105,8 @@ class OrderOutcome:
 
     ``fill`` contains only quantity that the broker has confirmed as executed.
     A working outcome may carry a partial fill while the remainder stays open.
+    A partial outcome records execution before the remaining order terminated;
+    a failed outcome confirms that the order terminated without a fill.
     An unknown outcome means submission or final state could not be confirmed;
     its identifiers must be reconciled before retrying.
     """
@@ -114,8 +118,15 @@ class OrderOutcome:
 
     def __post_init__(self) -> None:
         """Reject internally contradictory execution outcomes."""
-        if self.status is OrderOutcomeStatus.FILLED and self.fill is None:
-            raise ValueError("a filled outcome requires a confirmed fill")
+        if self.status in {
+            OrderOutcomeStatus.FILLED,
+            OrderOutcomeStatus.PARTIAL,
+        } and self.fill is None:
+            raise ValueError("a filled or partial outcome requires a confirmed fill")
+        if self.status is OrderOutcomeStatus.FAILED and not self.reference:
+            raise ValueError("a failed outcome requires an order reference")
+        if self.status is OrderOutcomeStatus.FAILED and self.fill is not None:
+            raise ValueError("a failed outcome cannot contain a fill")
         if self.status is OrderOutcomeStatus.WORKING and not self.order_id:
             raise ValueError("a working outcome requires a broker order id")
         if self.status is OrderOutcomeStatus.UNKNOWN and not (
@@ -138,6 +149,11 @@ class OrderOutcome:
     def is_working(self) -> bool:
         """Return whether the order remains open at the broker."""
         return self.status is OrderOutcomeStatus.WORKING
+
+    @property
+    def has_fill(self) -> bool:
+        """Return whether the outcome contains confirmed executed quantity."""
+        return self.fill is not None
 
     @property
     def is_pending(self) -> bool:

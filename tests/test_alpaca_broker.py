@@ -156,8 +156,8 @@ def test_zero_quantity_submits_nothing() -> None:
         "replaced",
     ],
 )
-def test_terminally_failed_order_raises(status: str) -> None:
-    """Surface rejected orders as errors instead of assuming a fill."""
+def test_terminally_failed_order_returns_explicit_failure(status: str) -> None:
+    """Return a terminal no-fill outcome without leaving an order pending."""
     broker, _ = make_broker(
         {
             ("POST", "/v2/orders"): [{"id": "oid-1", "status": "accepted"}],
@@ -165,8 +165,35 @@ def test_terminally_failed_order_raises(status: str) -> None:
         }
     )
 
-    with pytest.raises(AlpacaError, match=status):
-        broker.order_quantity("ACME", 1, "rebalance_buy")
+    outcome = broker.order_quantity("ACME", 1, "rebalance_buy")
+
+    assert outcome.status is OrderOutcomeStatus.FAILED
+    assert outcome.fill is None
+    assert broker.orders == []
+
+
+@pytest.mark.parametrize("status", ["canceled", "done_for_day"])
+def test_terminal_order_preserves_confirmed_partial_fill(status: str) -> None:
+    """Record shares that traded before the remaining order terminated."""
+    broker, _ = make_broker(
+        {
+            ("POST", "/v2/orders"): [{"id": "oid-1", "status": "accepted"}],
+            ("GET", "/v2/orders/oid-1"): [
+                {
+                    "status": status,
+                    "filled_avg_price": "10.25",
+                    "filled_qty": "1.5",
+                }
+            ],
+        }
+    )
+
+    outcome = broker.order_quantity("ACME", 2, "rebalance_buy")
+
+    assert outcome.status is OrderOutcomeStatus.PARTIAL
+    assert outcome.fill is broker.orders[0]
+    assert outcome.fill.quantity == 1.5
+    assert outcome.fill.price == 10.25
 
 
 def test_unfilled_order_times_out_without_raising() -> None:
@@ -211,6 +238,58 @@ def test_partially_filled_order_reports_only_confirmed_execution() -> None:
     assert outcome.fill.price == 10.25
 
 
+def test_reconciliation_replaces_cumulative_partial_fill_record() -> None:
+    """Update one execution record instead of double-counting cumulative fills."""
+    broker, _ = make_broker(
+        {
+            ("POST", "/v2/orders"): [{"id": "oid-1", "status": "accepted"}],
+            ("GET", "/v2/orders/oid-1"): [
+                {
+                    "status": "partially_filled",
+                    "filled_avg_price": "10.00",
+                    "filled_qty": "1",
+                },
+                {
+                    "status": "filled",
+                    "filled_avg_price": "10.25",
+                    "filled_qty": "2",
+                },
+            ],
+        },
+        fill_timeout=0.0,
+    )
+
+    pending = broker.order_quantity("ACME", 2, "rebalance_buy")
+    filled = broker.reconcile_order("oid-1")
+
+    assert pending.status is OrderOutcomeStatus.WORKING
+    assert filled.status is OrderOutcomeStatus.FILLED
+    assert len(broker.orders) == 1
+    assert broker.orders[0].quantity == 2.0
+    assert broker.orders[0].price == 10.25
+
+
+def test_reconciliation_reports_expired_working_order_as_failed() -> None:
+    """Release callers to retry after a previously working order terminates."""
+    broker, _ = make_broker(
+        {
+            ("POST", "/v2/orders"): [{"id": "oid-1", "status": "accepted"}],
+            ("GET", "/v2/orders/oid-1"): [
+                {"status": "new"},
+                {"status": "expired", "filled_qty": "0"},
+            ],
+        },
+        fill_timeout=0.0,
+    )
+
+    pending = broker.order_quantity("ACME", 1, "rebalance_buy")
+    failed = broker.reconcile_order("oid-1")
+
+    assert pending.status is OrderOutcomeStatus.WORKING
+    assert failed.status is OrderOutcomeStatus.FAILED
+    assert failed.fill is None
+
+
 def test_submission_without_order_id_is_explicitly_unknown() -> None:
     """Preserve an ambiguous accepted order for later reconciliation."""
     broker, _ = make_broker(
@@ -222,6 +301,31 @@ def test_submission_without_order_id_is_explicitly_unknown() -> None:
     assert outcome.status is OrderOutcomeStatus.UNKNOWN
     assert outcome.order_id is None
     assert outcome.client_order_id is not None
+
+
+def test_unknown_submission_can_be_reconciled_by_client_order_id() -> None:
+    """Recover a POST response that omitted its broker order identifier."""
+    broker, _ = make_broker(
+        {
+            ("POST", "/v2/orders"): [{"status": "accepted"}],
+            ("GET", "/v2/orders:by_client_order_id"): [
+                {
+                    "id": "oid-1",
+                    "client_order_id": "ignored-by-context",
+                    "status": "filled",
+                    "filled_avg_price": "10.5",
+                    "filled_qty": "1",
+                }
+            ],
+        }
+    )
+
+    unknown = broker.order_quantity("ACME", 1, "rebalance_buy")
+    filled = broker.reconcile_order(unknown.reference or "")
+
+    assert filled.status is OrderOutcomeStatus.FILLED
+    assert filled.order_id == "oid-1"
+    assert filled.fill is broker.orders[0]
 
 
 @pytest.mark.parametrize(

@@ -202,6 +202,12 @@ def test_order_outcome_rejects_contradictory_states() -> None:
 
     with pytest.raises(ValueError, match="requires a confirmed fill"):
         OrderOutcome(OrderOutcomeStatus.FILLED)
+    with pytest.raises(ValueError, match="requires a confirmed fill"):
+        OrderOutcome(OrderOutcomeStatus.PARTIAL, order_id="oid-1")
+    with pytest.raises(ValueError, match="requires an order reference"):
+        OrderOutcome(OrderOutcomeStatus.FAILED)
+    with pytest.raises(ValueError, match="cannot contain a fill"):
+        OrderOutcome(OrderOutcomeStatus.FAILED, order_id="oid-1", fill=fill)
     with pytest.raises(ValueError, match="requires a broker order id"):
         OrderOutcome(OrderOutcomeStatus.WORKING)
     with pytest.raises(ValueError, match="requires an order reference"):

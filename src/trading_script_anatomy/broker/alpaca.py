@@ -1,6 +1,7 @@
 """Alpaca-backed broker adapter for paper and live trading."""
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 import logging
 import math
 import os
@@ -57,8 +58,14 @@ class AlpacaRequestError(AlpacaError):
     """Raised when transport or decoding leaves a request result uncertain."""
 
 
-class AlpacaTerminalOrderError(AlpacaError):
-    """Raised when Alpaca confirms that an order ended without filling."""
+@dataclass(frozen=True, slots=True)
+class _OrderContext:
+    """Submission details needed to interpret later broker reconciliation."""
+
+    symbol: str
+    side: OrderSide
+    reason: str
+    client_order_id: str | None
 
 
 class AlpacaBroker:
@@ -122,6 +129,8 @@ class AlpacaBroker:
         self._sleep = sleep
         self._logger = logger or logging.getLogger(__name__)
         self._portfolio_cache: Portfolio | None = None
+        self._order_contexts: dict[str, _OrderContext] = {}
+        self._fill_record_indexes: dict[str, int] = {}
         self.orders: list[Order] = []
 
     @property
@@ -161,6 +170,83 @@ class AlpacaBroker:
         """Return whether the market is currently open for trading."""
         return bool(self.clock().get("is_open"))
 
+    def reconcile_order(self, reference: str) -> OrderOutcome:
+        """Refresh a working or ambiguous order without resubmitting it."""
+        reference = reference.strip()
+        if not reference:
+            raise ValueError("order reference must not be empty")
+        context = self._order_contexts.get(reference)
+        is_client_reference = reference.startswith("tsa-")
+        fallback_client_order_id = (
+            context.client_order_id
+            if context is not None
+            else reference if is_client_reference else None
+        )
+        try:
+            if is_client_reference:
+                payload = self._request(
+                    "GET",
+                    "/v2/orders:by_client_order_id",
+                    params={"client_order_id": reference},
+                )
+            else:
+                payload = self._request("GET", f"/v2/orders/{reference}")
+        except AlpacaError as error:
+            return self._unknown_outcome(
+                fallback_client_order_id,
+                error,
+                order_id=None if is_client_reference else reference,
+            )
+        self.refresh()
+        if not isinstance(payload, dict):
+            return self._unknown_outcome(
+                fallback_client_order_id,
+                AlpacaError("order reconciliation returned a non-object payload"),
+                order_id=None if is_client_reference else reference,
+            )
+
+        order_id = str(payload.get("id") or "").strip() or (
+            None if is_client_reference else reference
+        )
+        client_order_id = str(payload.get("client_order_id") or "").strip() or (
+            fallback_client_order_id
+        )
+        if context is None:
+            symbol = str(payload.get("symbol") or "").strip()
+            if not symbol:
+                return self._unknown_outcome(
+                    client_order_id,
+                    AlpacaError("order reconciliation returned no symbol"),
+                    order_id=order_id,
+                )
+            try:
+                side = OrderSide(str(payload.get("side") or ""))
+            except ValueError as error:
+                return self._unknown_outcome(
+                    client_order_id,
+                    AlpacaError("order reconciliation returned an invalid side"),
+                    order_id=order_id,
+                )
+            context = _OrderContext(
+                symbol=symbol,
+                side=side,
+                reason="reconciled_order",
+                client_order_id=client_order_id,
+            )
+        self._remember_context(context, order_id)
+        try:
+            status = self._status_from_payload(payload, order_id or reference)
+            return self._build_outcome(
+                status,
+                payload,
+                context,
+                order_id=order_id,
+            )
+        except AlpacaError as error:
+            return self._unknown_outcome(
+                client_order_id, error, order_id=order_id
+            )
+
     def order_quantity(
         self, symbol: str, quantity: float, reason: str
     ) -> OrderOutcome:
@@ -175,7 +261,7 @@ class AlpacaBroker:
             AlpacaError: If Alpaca rejects the order or it terminally fails.
 
         Returns:
-            Filled, working, unknown, or skipped execution outcome.
+            Filled, partial, failed, working, unknown, or skipped outcome.
         """
         if isinstance(quantity, bool) or not math.isfinite(quantity):
             raise ValueError("order quantity must be finite")
@@ -211,7 +297,7 @@ class AlpacaBroker:
             AlpacaError: If Alpaca rejects the order or it terminally fails.
 
         Returns:
-            Filled, working, or unknown execution outcome.
+            Filled, partial, failed, working, or unknown outcome.
         """
         if isinstance(value, bool) or not math.isfinite(value) or value < 0.01:
             raise ValueError("order value must be finite and at least 0.01")
@@ -236,6 +322,13 @@ class AlpacaBroker:
     ) -> OrderOutcome:
         """Submit an order, await its fill, and record the outcome."""
         client_order_id = payload["client_order_id"]
+        context = _OrderContext(
+            symbol=payload["symbol"],
+            side=side,
+            reason=reason,
+            client_order_id=client_order_id,
+        )
+        self._remember_context(context)
         try:
             submitted = self._request("POST", "/v2/orders", payload)
         except AlpacaRequestError as error:
@@ -253,40 +346,81 @@ class AlpacaBroker:
                 client_order_id,
                 AlpacaError("order submission returned no order id"),
             )
+        self._remember_context(context, order_id)
 
         try:
             status, order_payload = self._await_outcome(order_id)
-            fill = self._confirmed_fill(
-                order_payload, payload["symbol"], side, reason
+            return self._build_outcome(
+                status,
+                order_payload,
+                context,
+                order_id=order_id,
             )
-            if status is OrderOutcomeStatus.FILLED and fill is None:
-                raise AlpacaError(
-                    f"Order {order_id} reported filled without a valid fill"
-                )
-        except AlpacaTerminalOrderError:
-            raise
         except AlpacaError as error:
             return self._unknown_outcome(
                 client_order_id, error, order_id=order_id
             )
+
+    def _remember_context(
+        self, context: _OrderContext, order_id: str | None = None
+    ) -> None:
+        """Index submission context by every identifier available."""
+        if context.client_order_id:
+            self._order_contexts[context.client_order_id] = context
+        if order_id:
+            self._order_contexts[order_id] = context
+
+    def _build_outcome(
+        self,
+        status: OrderOutcomeStatus,
+        payload: dict[str, Any],
+        context: _OrderContext,
+        *,
+        order_id: str | None,
+    ) -> OrderOutcome:
+        """Build and record a normalized outcome from an Alpaca order payload."""
+        fill = self._confirmed_fill(
+            payload, context.symbol, context.side, context.reason
+        )
+        if status is OrderOutcomeStatus.FILLED and fill is None:
+            raise AlpacaError(
+                f"Order {order_id or context.client_order_id} reported filled "
+                "without a valid fill"
+            )
+        if status is OrderOutcomeStatus.FAILED and fill is not None:
+            status = OrderOutcomeStatus.PARTIAL
         if fill is not None:
-            self.orders.append(fill)
+            reference = order_id or context.client_order_id
+            if reference is None:
+                raise AlpacaError("confirmed fill has no order reference")
+            self._record_fill(reference, fill)
         return OrderOutcome(
             status,
             order_id=order_id,
-            client_order_id=client_order_id,
+            client_order_id=context.client_order_id,
             fill=fill,
         )
 
+    def _record_fill(self, reference: str, fill: Order) -> None:
+        """Keep one cumulative execution record per broker order."""
+        index = self._fill_record_indexes.get(reference)
+        if index is None:
+            self._fill_record_indexes[reference] = len(self.orders)
+            self.orders.append(fill)
+        else:
+            self.orders[index] = fill
+
     def _unknown_outcome(
         self,
-        client_order_id: str,
+        client_order_id: str | None,
         error: AlpacaError,
         *,
         order_id: str | None = None,
     ) -> OrderOutcome:
         """Return an outcome that callers must reconcile before retrying."""
         reference = order_id or client_order_id
+        if reference is None:
+            raise ValueError("unknown Alpaca outcome requires an order reference")
         self._logger.error(
             "Unable to determine outcome for order %s: %s", reference, error
         )
@@ -314,29 +448,39 @@ class AlpacaBroker:
                 raise AlpacaError(
                     f"Order {order_id} status returned a non-object payload"
                 )
-            status = str(order.get("status", ""))
-            if not status:
-                raise AlpacaError(f"Order {order_id} status was missing")
-            if status == "filled":
-                return OrderOutcomeStatus.FILLED, order
-            if status in _TERMINAL_FAILURE_STATUSES:
-                raise AlpacaTerminalOrderError(
-                    f"Order {order_id} ended with status {status!r}"
-                )
-            if status not in _WORKING_STATUSES:
-                raise AlpacaError(
-                    f"Order {order_id} returned unknown status {status!r}"
-                )
+            outcome_status = self._status_from_payload(order, order_id)
+            provider_status = str(order.get("status", ""))
+            if outcome_status in {
+                OrderOutcomeStatus.FILLED,
+                OrderOutcomeStatus.FAILED,
+            }:
+                return outcome_status, order
             if time.monotonic() >= deadline:
                 self._logger.warning(
                     "Order %s not filled after %.0fs (status %r); it remains "
                     "working — likely outside market hours",
                     order_id,
                     self._fill_timeout,
-                    status,
+                    provider_status,
                 )
                 return OrderOutcomeStatus.WORKING, order
             self._sleep(self._poll_interval)
+
+    @staticmethod
+    def _status_from_payload(
+        payload: dict[str, Any], reference: str
+    ) -> OrderOutcomeStatus:
+        """Normalize a current Alpaca lifecycle status."""
+        status = str(payload.get("status", ""))
+        if not status:
+            raise AlpacaError(f"Order {reference} status was missing")
+        if status == "filled":
+            return OrderOutcomeStatus.FILLED
+        if status in _TERMINAL_FAILURE_STATUSES:
+            return OrderOutcomeStatus.FAILED
+        if status in _WORKING_STATUSES:
+            return OrderOutcomeStatus.WORKING
+        raise AlpacaError(f"Order {reference} returned unknown status {status!r}")
 
     def _confirmed_fill(
         self,
@@ -380,7 +524,11 @@ class AlpacaBroker:
         )
 
     def _request(
-        self, method: str, path: str, payload: dict[str, str] | None = None
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, str] | None = None,
+        params: dict[str, str] | None = None,
     ) -> Any:
         """Return decoded JSON for an authenticated API request.
 
@@ -393,6 +541,7 @@ class AlpacaBroker:
                 f"{self._base_url}{path}",
                 headers=self._headers,
                 json=payload,
+                params=params,
                 timeout=30,
             )
         except requests.RequestException as error:
