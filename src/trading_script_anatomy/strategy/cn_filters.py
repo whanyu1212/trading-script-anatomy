@@ -34,9 +34,10 @@ def is_excluded_board(symbol: str) -> bool:
         symbol: Ticker whose first digits identify its exchange board.
 
     Returns:
-        True for ChiNext, STAR Market, and Beijing Exchange prefixes.
+        True for ChiNext, STAR Market, and old or current Beijing Exchange
+        prefixes.
     """
-    return len(symbol) >= 2 and symbol[:2] in {"30", "68", "8", "4"}
+    return len(symbol) >= 2 and symbol.startswith(("30", "68", "8", "4", "92"))
 
 
 def a_share_eligibility(symbol: str, info: SecurityInfo) -> bool:

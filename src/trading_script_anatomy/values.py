@@ -1,5 +1,7 @@
 """Value-coercion helpers shared by data adapters, strategy, and broker code."""
 
+import math
+
 import pandas as pd
 
 
@@ -12,11 +14,13 @@ def to_finite_float(value: object) -> float | None:
     Returns:
         The finite float, or ``None`` when conversion is impossible.
     """
+    if pd.api.types.is_bool(value):
+        return None
     try:
         number = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
-    return number if pd.notna(number) else None
+    return number if math.isfinite(number) else None
 
 
 def numeric_column(frame: pd.DataFrame, column: str) -> pd.Series:
@@ -31,7 +35,8 @@ def numeric_column(frame: pd.DataFrame, column: str) -> pd.Series:
     """
     if column not in frame.columns:
         return pd.Series(dtype=float)
-    return pd.to_numeric(frame[column], errors="coerce").dropna()
+    values = frame[column].map(to_finite_float)
+    return pd.to_numeric(values, errors="coerce").dropna()
 
 
 def latest_number(frame: pd.DataFrame, column: str) -> float | None:
