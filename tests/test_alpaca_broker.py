@@ -153,7 +153,6 @@ def test_zero_quantity_submits_nothing() -> None:
         "done_for_day",
         "expired",
         "rejected",
-        "replaced",
     ],
 )
 def test_terminally_failed_order_returns_explicit_failure(status: str) -> None:
@@ -194,6 +193,99 @@ def test_terminal_order_preserves_confirmed_partial_fill(status: str) -> None:
     assert outcome.fill is broker.orders[0]
     assert outcome.fill.quantity == 1.5
     assert outcome.fill.price == 10.25
+
+
+def test_replaced_order_tracks_its_live_successor() -> None:
+    """Return the replacement ID so callers never retry the original order."""
+    broker, _ = make_broker(
+        {
+            ("POST", "/v2/orders"): [{"id": "oid-1", "status": "accepted"}],
+            ("GET", "/v2/orders/oid-1"): [
+                {"id": "oid-1", "status": "replaced", "replaced_by": "oid-2"}
+            ],
+            ("GET", "/v2/orders/oid-2"): [FILLED],
+        }
+    )
+
+    replaced = broker.order_quantity("ACME", 3, "rebalance_buy")
+    filled = broker.reconcile_order(replaced.reference or "")
+
+    assert replaced.status is OrderOutcomeStatus.WORKING
+    assert replaced.order_id == "oid-2"
+    assert filled.status is OrderOutcomeStatus.FILLED
+    assert filled.order_id == "oid-2"
+
+
+def test_reconciliation_transfers_tracking_to_replacement() -> None:
+    """Follow a replacement discovered after an order was already pending."""
+    broker, _ = make_broker(
+        {
+            ("POST", "/v2/orders"): [{"id": "oid-1", "status": "accepted"}],
+            ("GET", "/v2/orders/oid-1"): [
+                {"id": "oid-1", "status": "new"},
+                {"id": "oid-1", "status": "replaced", "replaced_by": "oid-2"},
+            ],
+        },
+        fill_timeout=0.0,
+    )
+
+    pending = broker.order_quantity("ACME", 1, "rebalance_buy")
+    replaced = broker.reconcile_order(pending.reference or "")
+
+    assert pending.order_id == "oid-1"
+    assert replaced.status is OrderOutcomeStatus.WORKING
+    assert replaced.order_id == "oid-2"
+
+
+def test_replacement_preserves_fills_from_both_orders() -> None:
+    """Do not overwrite execution that occurred before replacement."""
+    broker, _ = make_broker(
+        {
+            ("POST", "/v2/orders"): [{"id": "oid-1", "status": "accepted"}],
+            ("GET", "/v2/orders/oid-1"): [
+                {
+                    "id": "oid-1",
+                    "status": "replaced",
+                    "replaced_by": "oid-2",
+                    "filled_avg_price": "10.00",
+                    "filled_qty": "1",
+                }
+            ],
+            ("GET", "/v2/orders/oid-2"): [
+                {
+                    "id": "oid-2",
+                    "status": "filled",
+                    "filled_avg_price": "10.25",
+                    "filled_qty": "2",
+                }
+            ],
+        }
+    )
+
+    replaced = broker.order_quantity("ACME", 3, "rebalance_buy")
+    broker.reconcile_order(replaced.reference or "")
+
+    assert [(order.quantity, order.price) for order in broker.orders] == [
+        (1.0, 10.0),
+        (2.0, 10.25),
+    ]
+
+
+def test_replaced_order_without_successor_fails_closed() -> None:
+    """Keep malformed replacement state ambiguous rather than retrying."""
+    broker, _ = make_broker(
+        {
+            ("POST", "/v2/orders"): [{"id": "oid-1", "status": "accepted"}],
+            ("GET", "/v2/orders/oid-1"): [
+                {"id": "oid-1", "status": "replaced", "replaced_by": ""}
+            ],
+        }
+    )
+
+    outcome = broker.order_quantity("ACME", 1, "rebalance_buy")
+
+    assert outcome.status is OrderOutcomeStatus.UNKNOWN
+    assert outcome.order_id == "oid-1"
 
 
 def test_unfilled_order_times_out_without_raising() -> None:

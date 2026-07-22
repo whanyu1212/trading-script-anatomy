@@ -13,6 +13,7 @@ import requests
 
 from trading_script_anatomy.broker.models import (
     BrokerExecutionError,
+    MIN_NOTIONAL_ORDER_VALUE,
     Order,
     OrderOutcome,
     OrderOutcomeStatus,
@@ -30,7 +31,6 @@ _TERMINAL_FAILURE_STATUSES = frozenset(
         "done_for_day",
         "expired",
         "rejected",
-        "replaced",
     }
 )
 
@@ -235,6 +235,18 @@ class AlpacaBroker:
             )
         self._remember_context(context, order_id)
         try:
+            if str(payload.get("status") or "") == "replaced":
+                replacement_id = self._replacement_id(
+                    payload, order_id or reference
+                )
+                self._remember_context(context, replacement_id)
+                return self._build_outcome(
+                    OrderOutcomeStatus.WORKING,
+                    payload,
+                    context,
+                    order_id=replacement_id,
+                    fill_reference=order_id or reference,
+                )
             status = self._status_from_payload(payload, order_id or reference)
             return self._build_outcome(
                 status,
@@ -299,7 +311,11 @@ class AlpacaBroker:
         Returns:
             Filled, partial, failed, working, or unknown outcome.
         """
-        if isinstance(value, bool) or not math.isfinite(value) or value < 0.01:
+        if (
+            isinstance(value, bool)
+            or not math.isfinite(value)
+            or value < MIN_NOTIONAL_ORDER_VALUE
+        ):
             raise ValueError("order value must be finite and at least 0.01")
         return self._submit_order(
             {
@@ -349,12 +365,16 @@ class AlpacaBroker:
         self._remember_context(context, order_id)
 
         try:
-            status, order_payload = self._await_outcome(order_id)
+            status, order_payload, effective_order_id = self._await_outcome(
+                order_id
+            )
+            self._remember_context(context, effective_order_id)
             return self._build_outcome(
                 status,
                 order_payload,
                 context,
-                order_id=order_id,
+                order_id=effective_order_id,
+                fill_reference=order_id,
             )
         except AlpacaError as error:
             return self._unknown_outcome(
@@ -377,6 +397,7 @@ class AlpacaBroker:
         context: _OrderContext,
         *,
         order_id: str | None,
+        fill_reference: str | None = None,
     ) -> OrderOutcome:
         """Build and record a normalized outcome from an Alpaca order payload."""
         fill = self._confirmed_fill(
@@ -390,7 +411,7 @@ class AlpacaBroker:
         if status is OrderOutcomeStatus.FAILED and fill is not None:
             status = OrderOutcomeStatus.PARTIAL
         if fill is not None:
-            reference = order_id or context.client_order_id
+            reference = fill_reference or order_id or context.client_order_id
             if reference is None:
                 raise AlpacaError("confirmed fill has no order reference")
             self._record_fill(reference, fill)
@@ -432,11 +453,11 @@ class AlpacaBroker:
 
     def _await_outcome(
         self, order_id: str
-    ) -> tuple[OrderOutcomeStatus, dict[str, Any]]:
+    ) -> tuple[OrderOutcomeStatus, dict[str, Any], str]:
         """Poll an order until it fills, terminally fails, or times out.
 
         Returns:
-            Normalized outcome status and the latest order payload.
+            Normalized outcome status, latest payload, and effective order ID.
 
         Raises:
             AlpacaError: If the order reaches a terminal failure status.
@@ -448,13 +469,19 @@ class AlpacaBroker:
                 raise AlpacaError(
                     f"Order {order_id} status returned a non-object payload"
                 )
-            outcome_status = self._status_from_payload(order, order_id)
             provider_status = str(order.get("status", ""))
+            if provider_status == "replaced":
+                return (
+                    OrderOutcomeStatus.WORKING,
+                    order,
+                    self._replacement_id(order, order_id),
+                )
+            outcome_status = self._status_from_payload(order, order_id)
             if outcome_status in {
                 OrderOutcomeStatus.FILLED,
                 OrderOutcomeStatus.FAILED,
             }:
-                return outcome_status, order
+                return outcome_status, order, order_id
             if time.monotonic() >= deadline:
                 self._logger.warning(
                     "Order %s not filled after %.0fs (status %r); it remains "
@@ -463,8 +490,18 @@ class AlpacaBroker:
                     self._fill_timeout,
                     provider_status,
                 )
-                return OrderOutcomeStatus.WORKING, order
+                return OrderOutcomeStatus.WORKING, order, order_id
             self._sleep(self._poll_interval)
+
+    @staticmethod
+    def _replacement_id(payload: dict[str, Any], reference: str) -> str:
+        """Return the live successor referenced by a replaced Alpaca order."""
+        replacement_id = str(payload.get("replaced_by") or "").strip()
+        if not replacement_id:
+            raise AlpacaError(
+                f"Order {reference} was replaced without a replacement order id"
+            )
+        return replacement_id
 
     @staticmethod
     def _status_from_payload(

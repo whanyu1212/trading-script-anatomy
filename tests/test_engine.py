@@ -252,6 +252,21 @@ def test_engine_does_not_swallow_invalid_broker_calls() -> None:
         engine.handle_stop_loss_funds(datetime(2025, 6, 3, 14, 0))
 
 
+def test_sub_cent_safe_etf_cash_is_skipped_without_broker_call() -> None:
+    """Treat defensive cash dust as retryable instead of raising validation."""
+    broker = ScriptedBroker(Portfolio(cash=0.001))
+    engine = StrategyEngine(
+        StrategyConfig(), FakeMarketData(), FakeUniverse(()), broker
+    )
+    engine.state.stopped_out = True
+
+    engine.handle_stop_loss_funds(datetime(2025, 6, 3, 14, 0))
+
+    assert broker.value_calls == []
+    assert engine.state.stopped_out is True
+    assert engine.state.stop_loss_etf_bought is False
+
+
 def test_empty_month_waits_for_working_equity_sale_before_safe_etf() -> None:
     """Do not sequence the defensive purchase before liquidation completes."""
     config = StrategyConfig(empty_months=(4,))
@@ -354,6 +369,107 @@ def test_uncertain_rebalance_purchase_stops_later_targets(
 
     assert engine.state.target_positions == list(symbols)
     assert len(broker.value_calls) == 1
+    assert engine.state.last_rebalance_date is None
+
+
+def test_terminal_partial_rebalance_buy_tops_up_unfilled_value() -> None:
+    """Finish a terminal partial buy before allocating the next target."""
+    as_of = date(2025, 6, 3)
+    symbols = ("000001.SZ", "000002.SZ")
+    data = FakeMarketData(
+        infos={
+            symbol: SecurityInfo(symbol, symbol, date(2023, 1, 1))
+            for symbol in symbols
+        },
+        financials={
+            symbol: FinancialSnapshot(1.5e9, 2e8, 1e7, 1e7)
+            for symbol in symbols
+        },
+        bars={
+            "399106.SZ": bars([100.0] * 10),
+            **{symbol: bars([10.0]) for symbol in symbols},
+        },
+    )
+    partial_fill = Order(
+        symbols[0], 2.0, OrderSide.BUY, 10.0, "rebalance_buy"
+    )
+    top_up_fill = Order(
+        symbols[0], 3.0, OrderSide.BUY, 10.0, "rebalance_buy"
+    )
+    second_fill = Order(
+        symbols[1], 5.0, OrderSide.BUY, 10.0, "rebalance_buy"
+    )
+    portfolio = Portfolio(cash=100.0)
+    broker = ScriptedBroker(
+        portfolio,
+        value_results=(
+            OrderOutcome(
+                OrderOutcomeStatus.PARTIAL,
+                order_id="buy-1",
+                fill=partial_fill,
+            ),
+            OrderOutcome(OrderOutcomeStatus.FILLED, fill=top_up_fill),
+            OrderOutcome(OrderOutcomeStatus.FILLED, fill=second_fill),
+        ),
+    )
+    engine = StrategyEngine(
+        StrategyConfig(initial_stock_count=2, finance_candidate_multiplier=1),
+        data,
+        FakeUniverse(symbols),
+        broker,
+    )
+
+    engine.weekly_rebalance(as_of)
+
+    assert broker.value_calls == [(symbols[0], 50.0, "rebalance_buy")]
+    assert engine.state.weekly_buy_remaining_values == {symbols[0]: 30.0}
+    assert engine.state.last_rebalance_date is None
+
+    portfolio.cash = 80.0
+    portfolio.positions[symbols[0]] = Position(
+        symbols[0], 2.0, 10.0, 10.0
+    )
+    engine.weekly_rebalance(as_of)
+
+    assert broker.value_calls == [
+        (symbols[0], 50.0, "rebalance_buy"),
+        (symbols[0], 30.0, "rebalance_buy"),
+        (symbols[1], 50.0, "rebalance_buy"),
+    ]
+    assert engine.state.weekly_buy_remaining_values == {}
+    assert engine.state.last_rebalance_date == as_of
+
+
+def test_sub_cent_rebalance_allocation_is_retained_without_broker_call() -> None:
+    """Leave an unaffordable target incomplete without aborting rebalance."""
+    as_of = date(2025, 6, 3)
+    symbols = ("000001.SZ", "000002.SZ")
+    data = FakeMarketData(
+        infos={
+            symbol: SecurityInfo(symbol, symbol, date(2023, 1, 1))
+            for symbol in symbols
+        },
+        financials={
+            symbol: FinancialSnapshot(1.5e9, 2e8, 1e7, 1e7)
+            for symbol in symbols
+        },
+        bars={
+            "399106.SZ": bars([100.0] * 10),
+            **{symbol: bars([10.0]) for symbol in symbols},
+        },
+    )
+    broker = ScriptedBroker(Portfolio(cash=0.01))
+    engine = StrategyEngine(
+        StrategyConfig(initial_stock_count=2, finance_candidate_multiplier=1),
+        data,
+        FakeUniverse(symbols),
+        broker,
+    )
+
+    engine.weekly_rebalance(as_of)
+
+    assert broker.value_calls == []
+    assert engine.state.weekly_buy_remaining_values == {symbols[0]: 0.005}
     assert engine.state.last_rebalance_date is None
 
 

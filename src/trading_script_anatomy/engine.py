@@ -6,6 +6,7 @@ import logging
 
 from trading_script_anatomy.broker.models import (
     BrokerExecutionError,
+    MIN_NOTIONAL_ORDER_VALUE,
     OrderOutcome,
     OrderOutcomeStatus,
 )
@@ -304,32 +305,58 @@ class StrategyEngine:
 
     def _buy_missing_positions(self, target_symbols: Collection[str]) -> bool:
         """Buy missing targets and report whether every purchase filled."""
+        target_set = set(target_symbols)
+        for symbol in set(self.state.weekly_buy_remaining_values) - target_set:
+            self.state.weekly_buy_remaining_values.pop(symbol, None)
+
+        completed = True
+        attempted_symbols: set[str] = set()
+        available_cash = self.broker.portfolio.cash
+        for symbol in target_symbols:
+            remaining_value = self.state.weekly_buy_remaining_values.get(symbol)
+            if remaining_value is None:
+                continue
+            attempted_symbols.add(symbol)
+            if available_cash <= 0:
+                return False
+            requested_value = min(remaining_value, available_cash)
+            outcome = self._buy_weekly_position(symbol, requested_value)
+            if outcome is None:
+                completed = False
+                continue
+            if outcome.has_fill and outcome.fill is not None:
+                available_cash = max(
+                    available_cash
+                    - outcome.fill.quantity * outcome.fill.price,
+                    0.0,
+                )
+            if outcome.is_filled:
+                continue
+            completed = False
+            if outcome.status is OrderOutcomeStatus.FAILED:
+                continue
+            return False
+
         held_symbols = self._equity_symbols()
         to_buy = [
-            symbol for symbol in target_symbols if symbol not in held_symbols
+            symbol
+            for symbol in target_symbols
+            if symbol not in held_symbols and symbol not in attempted_symbols
         ]
         slots = min(len(target_symbols), self.state.stock_count) - len(held_symbols)
         to_buy = to_buy[:max(slots, 0)]
         if not to_buy:
-            return True
-        if self.broker.portfolio.cash <= 0:
+            return completed
+        available_cash = min(available_cash, self.broker.portfolio.cash)
+        if available_cash <= 0:
             return False
 
-        cash_per_symbol = self.broker.portfolio.cash / len(to_buy)
-        completed = True
+        cash_per_symbol = available_cash / len(to_buy)
         for symbol in to_buy:
-            try:
-                outcome = self.broker.order_value(
-                    symbol, cash_per_symbol, "rebalance_buy"
-                )
-            except BrokerExecutionError as error:
-                self._logger.error(
-                    "Unable to rebalance-buy %s: %s", symbol, error
-                )
-                self.state.pending_weekly_buy_orders.pop(symbol, None)
+            outcome = self._buy_weekly_position(symbol, cash_per_symbol)
+            if outcome is None:
                 completed = False
                 continue
-            self._track_weekly_buy(symbol, outcome)
             if outcome.is_filled:
                 continue
             completed = False
@@ -349,6 +376,29 @@ class StrategyEngine:
             return False
         return completed
 
+    def _buy_weekly_position(
+        self, symbol: str, value: float
+    ) -> OrderOutcome | None:
+        """Submit and retain progress for one weekly equity purchase."""
+        if value < MIN_NOTIONAL_ORDER_VALUE:
+            self._logger.warning(
+                "Skipping rebalance-buy for %s: %.6f is below the minimum "
+                "notional",
+                symbol,
+                value,
+            )
+            outcome = OrderOutcome(OrderOutcomeStatus.SKIPPED)
+            self._track_weekly_buy(symbol, outcome, value)
+            return outcome
+        try:
+            outcome = self.broker.order_value(symbol, value, "rebalance_buy")
+        except BrokerExecutionError as error:
+            self._logger.error("Unable to rebalance-buy %s: %s", symbol, error)
+            self._track_weekly_buy(symbol, None, value)
+            return None
+        self._track_weekly_buy(symbol, outcome, value)
+        return outcome
+
     def _sell_safe_etf(self) -> bool:
         """Sell the safe ETF and report whether the required sale filled."""
         position = self._position(self.config.safe_etf_symbol)
@@ -366,6 +416,12 @@ class StrategyEngine:
         """Invest available cash and return the broker's explicit outcome."""
         cash = self.broker.portfolio.cash
         if cash <= 0:
+            return OrderOutcome(OrderOutcomeStatus.SKIPPED)
+        if cash < MIN_NOTIONAL_ORDER_VALUE:
+            self._logger.warning(
+                "Skipping safe ETF purchase: %.6f is below the minimum notional",
+                cash,
+            )
             return OrderOutcome(OrderOutcomeStatus.SKIPPED)
         try:
             outcome = self.broker.order_value(
@@ -385,8 +441,11 @@ class StrategyEngine:
 
     def _buy_safe_etf_weekly(self) -> OrderOutcome | None:
         """Buy the safe ETF and retain a weekly order requiring reconciliation."""
+        requested_value = self.broker.portfolio.cash
         outcome = self._buy_safe_etf()
-        self._track_weekly_buy(self.config.safe_etf_symbol, outcome)
+        self._track_weekly_buy(
+            self.config.safe_etf_symbol, outcome, requested_value
+        )
         return outcome
 
     @staticmethod
@@ -431,15 +490,42 @@ class StrategyEngine:
         return outcome
 
     def _track_weekly_buy(
-        self, symbol: str, outcome: OrderOutcome | None
+        self,
+        symbol: str,
+        outcome: OrderOutcome | None,
+        requested_value: float | None = None,
     ) -> None:
-        """Retain a weekly purchase reference only while execution is pending."""
+        """Retain live references and cash still needed after partial execution."""
+        if outcome is not None and outcome.is_filled:
+            self.state.pending_weekly_buy_orders.pop(symbol, None)
+            self.state.weekly_buy_remaining_values.pop(symbol, None)
+            return
+
+        remaining_value = requested_value
+        if remaining_value is None:
+            remaining_value = self.state.weekly_buy_remaining_values.get(symbol)
+        if (
+            outcome is not None
+            and outcome.status is OrderOutcomeStatus.PARTIAL
+            and outcome.fill is not None
+        ):
+            if remaining_value is not None:
+                remaining_value = max(
+                    remaining_value
+                    - outcome.fill.quantity * outcome.fill.price,
+                    0.0,
+                )
+
         if outcome is not None and outcome.is_pending:
             reference = outcome.reference
             if reference is not None:
                 self.state.pending_weekly_buy_orders[symbol] = reference
-        elif outcome is not None:
+        else:
             self.state.pending_weekly_buy_orders.pop(symbol, None)
+        if remaining_value is not None and remaining_value > 0:
+            self.state.weekly_buy_remaining_values[symbol] = remaining_value
+        else:
+            self.state.weekly_buy_remaining_values.pop(symbol, None)
 
     def _weekly_order_flow_ready(self) -> bool:
         """Reconcile cross-lifecycle orders before submitting weekly orders."""
@@ -510,7 +596,11 @@ class StrategyEngine:
                     )
                 completed = False
                 continue
-            self.state.pending_weekly_buy_orders.pop(symbol, None)
+            self._track_weekly_buy(
+                symbol,
+                outcome,
+                self.state.weekly_buy_remaining_values.get(symbol),
+            )
         return completed
 
     def _reconcile_pending_exits(self) -> bool:

@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from enum import StrEnum
 
+MIN_NOTIONAL_ORDER_VALUE = 0.01
+
 
 class OrderSide(StrEnum):
     """Direction of an order."""

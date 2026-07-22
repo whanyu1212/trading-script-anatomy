@@ -19,6 +19,7 @@ class StrategyState:
         incomplete_exit_reasons: Risk-exit reasons to retry by held symbol.
         pending_weekly_sale_orders: Unresolved weekly-sale identifiers by symbol.
         pending_weekly_buy_orders: Unresolved weekly-buy identifiers by symbol.
+        weekly_buy_remaining_values: Intended weekly-buy cash still unfilled.
         last_rebalance_date: Date of the latest completed weekly rebalance.
     """
 
@@ -32,4 +33,5 @@ class StrategyState:
     incomplete_exit_reasons: dict[str, str] = field(default_factory=dict)
     pending_weekly_sale_orders: dict[str, str] = field(default_factory=dict)
     pending_weekly_buy_orders: dict[str, str] = field(default_factory=dict)
+    weekly_buy_remaining_values: dict[str, float] = field(default_factory=dict)
     last_rebalance_date: date | None = None
