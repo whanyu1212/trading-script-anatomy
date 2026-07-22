@@ -3,7 +3,14 @@
 from collections.abc import Callable, Mapping, Sequence
 import math
 
-from trading_script_anatomy.broker.models import CostModel, Order, OrderSide
+from trading_script_anatomy.broker.models import (
+    BrokerExecutionError,
+    CostModel,
+    Order,
+    OrderOutcome,
+    OrderOutcomeStatus,
+    OrderSide,
+)
 from trading_script_anatomy.portfolio import Portfolio, Position
 
 
@@ -78,7 +85,17 @@ class InMemoryBroker:
         """Remove all immediate-fill prices from the previous execution cycle."""
         self._prices.clear()
 
-    def order_quantity(self, symbol: str, quantity: float, reason: str) -> None:
+    def reconcile_order(self, reference: str) -> OrderOutcome:
+        """Reject reconciliation because simulated orders never remain open."""
+        if not reference.strip():
+            raise ValueError("order reference must not be empty")
+        raise BrokerExecutionError(
+            f"in-memory broker has no unresolved order {reference}"
+        )
+
+    def order_quantity(
+        self, symbol: str, quantity: float, reason: str
+    ) -> OrderOutcome:
         """Execute a signed quantity order at the configured price.
 
         Args:
@@ -87,17 +104,23 @@ class InMemoryBroker:
             reason: Strategy event that triggered the order.
 
         Raises:
-            ValueError: If the order is invalid or cannot be filled.
+            BrokerExecutionError: If the order cannot be filled.
+
+        Returns:
+            Filled outcome, or skipped when ``quantity`` is zero.
         """
+        if isinstance(quantity, bool) or not math.isfinite(quantity):
+            raise ValueError("order quantity must be finite")
         if quantity == 0:
-            return
+            return OrderOutcome(OrderOutcomeStatus.SKIPPED)
         price = self._price_for(symbol)
         if quantity > 0:
-            self._buy(symbol, quantity, price, reason)
+            fill = self._buy(symbol, quantity, price, reason)
         else:
-            self._sell(symbol, -quantity, price, reason)
+            fill = self._sell(symbol, -quantity, price, reason)
+        return OrderOutcome(OrderOutcomeStatus.FILLED, fill=fill)
 
-    def order_value(self, symbol: str, value: float, reason: str) -> None:
+    def order_value(self, symbol: str, value: float, reason: str) -> OrderOutcome:
         """Invest a positive cash amount at the configured price.
 
         Args:
@@ -106,23 +129,27 @@ class InMemoryBroker:
             reason: Strategy event that triggered the order.
 
         Raises:
-            ValueError: If ``value`` is non-positive, cannot cover execution
-                costs, or exceeds available cash.
+            ValueError: If ``value`` is non-positive, non-finite, or boolean.
+            BrokerExecutionError: If the value cannot cover execution costs
+                or the order otherwise cannot be filled.
+
+        Returns:
+            Filled outcome.
         """
-        if value <= 0:
-            raise ValueError("order value must be positive")
+        if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            raise ValueError("order value must be positive and finite")
         budget = self._costs.investable(value)
         if budget <= 0:
-            raise ValueError("order value does not cover execution costs")
+            raise BrokerExecutionError("order value does not cover execution costs")
         fill_price = self._costs.buy_price(self._price_for(symbol))
-        self.order_quantity(symbol, budget / fill_price, reason)
+        return self.order_quantity(symbol, budget / fill_price, reason)
 
-    def _buy(self, symbol: str, quantity: float, price: float, reason: str) -> None:
+    def _buy(self, symbol: str, quantity: float, price: float, reason: str) -> Order:
         fill_price = self._costs.buy_price(price)
         notional = quantity * fill_price
         total = notional + self._costs.commission(notional)
         if total > self._portfolio.cash + 1e-9:
-            raise ValueError(f"insufficient cash to buy {symbol}")
+            raise BrokerExecutionError(f"insufficient cash to buy {symbol}")
         position = self._portfolio.positions.get(symbol)
         if position is None:
             self._portfolio.positions[symbol] = Position(
@@ -137,12 +164,14 @@ class InMemoryBroker:
             position.cost_basis = total_cost / position.quantity
             position.last_price = fill_price
         self._portfolio.cash -= total
-        self.orders.append(Order(symbol, quantity, OrderSide.BUY, fill_price, reason))
+        fill = Order(symbol, quantity, OrderSide.BUY, fill_price, reason)
+        self.orders.append(fill)
+        return fill
 
-    def _sell(self, symbol: str, quantity: float, price: float, reason: str) -> None:
+    def _sell(self, symbol: str, quantity: float, price: float, reason: str) -> Order:
         position = self._portfolio.positions.get(symbol)
         if position is None or quantity > position.quantity + 1e-9:
-            raise ValueError(f"insufficient shares to sell {symbol}")
+            raise BrokerExecutionError(f"insufficient shares to sell {symbol}")
         fill_price = self._costs.sell_price(price)
         notional = quantity * fill_price
         fees = self._costs.commission(notional) + self._costs.sell_tax(notional)
@@ -151,7 +180,9 @@ class InMemoryBroker:
         self._portfolio.cash += notional - fees
         if position.quantity <= 1e-9:
             del self._portfolio.positions[symbol]
-        self.orders.append(Order(symbol, quantity, OrderSide.SELL, fill_price, reason))
+        fill = Order(symbol, quantity, OrderSide.SELL, fill_price, reason)
+        self.orders.append(fill)
+        return fill
 
     def _price_for(self, symbol: str) -> float:
         price = self._prices.get(symbol)
@@ -163,5 +194,7 @@ class InMemoryBroker:
             or not math.isfinite(price)
             or price <= 0
         ):
-            raise ValueError(f"missing positive execution price for {symbol}")
+            raise BrokerExecutionError(
+                f"missing positive execution price for {symbol}"
+            )
         return price
